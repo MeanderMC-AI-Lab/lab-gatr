@@ -3,12 +3,12 @@ from argparse import ArgumentParser
 from lab_gatr.transforms import PointCloudPoolingScales
 import torch_geometric as pyg
 from datasets import Dataset
-import wandb_impostor as wandb
+import wandb as wandb
 from lab_gatr import LaBGATr
 # from lab_gatr.models import LaBVaTr  # geometric algebra ablated LaB-GATr
 import torch
 from torch_cluster import knn
-from gatr.interface import embed_point, embed_oriented_plane, extract_oriented_plane
+from gatr.interface import embed_point, embed_oriented_plane, extract_oriented_plane, extract_translation
 import os
 from tqdm import tqdm
 import statistics
@@ -21,7 +21,8 @@ from time import asctime
 
 
 parser = ArgumentParser()
-
+parser.add_argument('--data_root', type=str, default='/data/Predict-Pneumoperitoneum_LaB-GATr/dataset')
+parser.add_argument('--pooling_mode', type=str, default='cross_attention')  # message_passing, cross_attention
 parser.add_argument('--num_gpus', type=int, default=1)
 parser.add_argument('--num_epochs', type=int, default=0)
 parser.add_argument('--run_id', type=str, default=None)
@@ -32,32 +33,34 @@ wandb_config = {
     'batch_size': 1,
     'learning_rate': 3e-4,  # best learning rate for Adam, hands down
     'num_epochs': args.num_epochs,
-    'lr_decay_gamma': 0.9989
+    'lr_decay_gamma': 0.9989,
+    'interp_simplex': 'triangle'  # triangle or tetrahedron
 }
 
 
 def main(rank, num_gpus):
     ddp_setup(rank, num_gpus, project_name="lab_gatr", wandb_config=wandb_config, run_id=args.run_id)
 
-    dataset = Dataset("debug-dataset", pre_transform=pyg.transforms.Compose((
-        PointCloudPoolingScales(rel_sampling_ratios=(0.01,), interp_simplex='tetrahedron'),
-        positional_encoding
+    dataset = Dataset(args.data_root, pre_transform=pyg.transforms.Compose((
+        PointCloudPoolingScales(rel_sampling_ratios=(0.01,), interp_simplex=wandb_config['interp_simplex']),
+        # positional_encoding
     )))
 
+    # Split: 52 train, 6 validation, 7 test
     training_data_loader = pyg.loader.DataLoader(
-        dataset[get_dataset_slices_for_gpus(num_gpus, num_samples=16)[rank]],
+        dataset[get_dataset_slices_for_gpus(num_gpus, num_samples=52)[rank]],
         batch_size=wandb.config['batch_size'],
         shuffle=True
     )
     validation_data_loader = pyg.loader.DataLoader(
-        dataset[get_dataset_slices_for_gpus(num_gpus, num_samples=2, first_sample_idx=16)[rank]],
+        dataset[get_dataset_slices_for_gpus(num_gpus, num_samples=6, first_sample_idx=52)[rank]],
         batch_size=wandb.config['batch_size'],
         shuffle=True
     )
-    test_dataset_slice = slice(18, 20)
-    visualisation_dataset_range = range(18, 20)
+    test_dataset_slice = slice(58, 65)
+    visualisation_dataset_range = range(58, 65)
 
-    neural_network = LaBGATr(GeometricAlgebraInterface, d_model=8, num_blocks=10, num_attn_heads=4)
+    neural_network = LaBGATr(GeometricAlgebraInterface, d_model=8, num_blocks=10, num_attn_heads=4, pooling_mode=args.pooling_mode)
     # neural_network = LaBVaTr(num_input_channels=12, num_output_channels=3, d_model=128, num_blocks=12, num_attn_heads=8)
 
     training_device = torch.device(f'cuda:{rank}')
@@ -91,55 +94,78 @@ def main(rank, num_gpus):
     ddp_cleanup()
 
 
-@torch.no_grad()
-def positional_encoding(data):
+# @torch.no_grad()
+# def positional_encoding(data):
 
-    vectors_to = {key: data.pos[value.long()] - data.pos for key, value in compute_nearest_boundary_vertex(data).items()}
-    distances_to = {key: torch.linalg.norm(value, dim=-1, keepdim=True) for key, value in vectors_to.items()}
+#     vectors_to = {key: data.pos[value.long()] - data.pos for key, value in compute_nearest_boundary_vertex(data).items()}
+#     distances_to = {key: torch.linalg.norm(value, dim=-1, keepdim=True) for key, value in vectors_to.items()}
 
-    data.x = torch.cat((
-        vectors_to['inlet'] / torch.clamp(distances_to['inlet'], min=1e-16),
-        vectors_to['lumen_wall'] / torch.clamp(distances_to['lumen_wall'], min=1e-16),
-        vectors_to['outlets'] / torch.clamp(distances_to['outlets'], min=1e-16),
-        distances_to['inlet'],
-        distances_to['lumen_wall'],
-        distances_to['outlets']
-    ), dim=1)
+#     data.x = torch.cat((
+#         vectors_to['inlet'] / torch.clamp(distances_to['inlet'], min=1e-16),
+#         vectors_to['lumen_wall'] / torch.clamp(distances_to['lumen_wall'], min=1e-16),
+#         vectors_to['outlets'] / torch.clamp(distances_to['outlets'], min=1e-16),
+#         distances_to['inlet'],
+#         distances_to['lumen_wall'],
+#         distances_to['outlets']
+#     ), dim=1)
 
-    return data
+#     return data
 
 
-def compute_nearest_boundary_vertex(data):
-    index_dict = {}
+# def compute_nearest_boundary_vertex(data):
+#     index_dict = {}
 
-    for key in ('inlet', 'lumen_wall', 'outlets'):
-        index_dict[key] = data[f'{key}_index'][knn(data.pos[data[f'{key}_index'].long()], data.pos, k=1)[1].long()]
+#     for key in ('inlet', 'lumen_wall', 'outlets'):
+#         index_dict[key] = data[f'{key}_index'][knn(data.pos[data[f'{key}_index'].long()], data.pos, k=1)[1].long()]
 
-    return index_dict
+#     return index_dict
+
+
+# class GeometricAlgebraInterface:
+#     num_input_channels = 1 + 3  # vertex positions plus positional encoding vectors
+#     num_output_channels = 1
+
+#     num_input_scalars = 3  # positional encoding sclars
+#     num_output_scalars = None
+
+#     @staticmethod
+#     @torch.no_grad()
+#     def embed(data):
+
+#         multivectors = torch.cat((
+#             embed_point(data.pos).view(-1, 1, 16),
+#             *(embed_oriented_plane(data.x[:, slice(i * 3, i * 3 + 3)], data.pos).view(-1, 1, 16) for i in range(3))
+#         ), dim=1)
+#         scalars = data.x[:, 9:]
+
+#         return multivectors, scalars
+
+#     @staticmethod
+#     def dislodge(multivectors, scalars):
+#         return extract_oriented_plane(multivectors).squeeze()
+
 
 
 class GeometricAlgebraInterface:
-    num_input_channels = 1 + 3  # vertex positions plus positional encoding vectors
+    num_input_channels = 1  # vertex normals + pos
     num_output_channels = 1
-
-    num_input_scalars = 3  # positional encoding sclars
-    num_output_scalars = None
+    num_input_scalars = 1
+    num_output_scalars = 1
 
     @staticmethod
     @torch.no_grad()
     def embed(data):
-
-        multivectors = torch.cat((
-            embed_point(data.pos).view(-1, 1, 16),
-            *(embed_oriented_plane(data.x[:, slice(i * 3, i * 3 + 3)], data.pos).view(-1, 1, 16) for i in range(3))
-        ), dim=1)
-        scalars = data.x[:, 9:]
+        multivectors = embed_oriented_plane(normal=data.norm, position=data.pos).view(-1, 1, 16)
+        scalars = torch.zeros(data.pos.shape[0], 1, device=data.pos.device)
 
         return multivectors, scalars
 
     @staticmethod
     def dislodge(multivectors, scalars):
-        return extract_oriented_plane(multivectors).squeeze()
+        output = extract_oriented_plane(multivectors).squeeze()
+        # output = extract_translation(multivectors).squeeze()
+
+        return output
 
 
 def get_dataset_slices_for_gpus(num_gpus, num_samples, first_sample_idx=0):
@@ -268,11 +294,11 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
                 os.makedirs(working_directory)
 
             data.cpu()
-            meshio.Mesh(data.pos, [('tetra', data.tets.T)], point_data={
-                'reference': data.y,
-                'prediction': data.Y,
-                'clusters': data.scale0_pool_target
-            }).write(os.path.join(working_directory, f"visuals_idx_{idx:04d}.vtu"))
+            # meshio.Mesh(data.pos, [('tetra', data.tets.T)], point_data={
+            #     'reference': data.y,
+            #     'prediction': data.Y,
+            #     'clusters': data.scale0_pool_target
+            # }).write(os.path.join(working_directory, f"visuals_idx_{idx:04d}.vtu"))
 
 
 def ddp_setup(rank, num_gpus, project_name, wandb_config, run_id=None):

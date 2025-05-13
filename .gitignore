@@ -1,0 +1,11 @@
+wandb
+exp*
+build
+
+*/.ipynb_checkpoints
+.ipynb_checkpoints
+
+*/__pycache__
+__pycache__
+
+lab_gatr.egg-info
