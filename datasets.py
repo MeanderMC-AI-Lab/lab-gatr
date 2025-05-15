@@ -38,10 +38,13 @@ class Dataset(pyg.data.Dataset):
     def read_raw_datafile(path):
         datafile = torch.load(path, weights_only=False)
         data = Data(
-            y=datafile['displacements'].float(),
-            pos=datafile['input_points'].float(),
-            norm=datafile['input_normals'].float(),
-            feat=datafile['patient_features'].float()
+            y=datafile['displacements'].float(),               # NeuralODE displacement samples
+            pos=datafile['input_points'].float(),              # Measured pointcloud before insufflation
+            norm=datafile['input_normals'].float(),            # Vertex normals calculated from mesh
+            feat=datafile['patient_features'].float(),         # Patient features, such as length
+            anns_start=datafile['annotations_start'].float(),  # Labelled locations on not-insufflated abdomen
+            anns_end=datafile['annotations_end'].float(),      # Labelled locations on insufflated abdomen
+            pos_end=datafile['target_points'].float()          # Measured pointcloud after insufflation
         )
         return data
 

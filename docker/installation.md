@@ -5,7 +5,7 @@
 - Install other dependencies: ```pip install torch_scatter torch_cluster --find-links https://data.pyg.org/whl/torch-2.6.0+cu126.html```
 - Install GATr: ```pip install git+https://github.com/Qualcomm-AI-research/geometric-algebra-transformer.git```
 - Install LaB-GATr: ```pip install .``` inside main folder
-- Install: ```pip install prettytable meshio```
+- Install: ```pip install prettytable meshio chamferdist```
 
 # Install dependencies for loading meshes
 

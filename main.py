@@ -3,7 +3,7 @@ from argparse import ArgumentParser
 from lab_gatr.transforms import PointCloudPoolingScales
 import torch_geometric as pyg
 from datasets import Dataset
-import wandb as wandb
+import wandb_impostor as wandb
 from lab_gatr import LaBGATr
 # from lab_gatr.models import LaBVaTr  # geometric algebra ablated LaB-GATr
 import torch
@@ -14,10 +14,12 @@ from tqdm import tqdm
 import statistics
 from torch.nn.parallel import DistributedDataParallel
 from functools import partial
-from utils import AccuracyAnalysis
+from utils import Evaluation, calc_closest_preds, calc_chamfer_distance
 import meshio
 import sys
 from time import asctime
+from visualisation import save_pred_and_gt_pointclouds
+from chamferdist import ChamferDistance
 
 
 parser = ArgumentParser()
@@ -261,8 +263,8 @@ def save_neural_network_weights(neural_network, working_directory="", file_name=
 
 
 def test_loop(neural_network, training_device, dataset, test_dataset_slice, visualisation_dataset_range, working_directory):
-    accuracy_analysis = {'y': AccuracyAnalysis()}
-
+    evaluation = Evaluation()
+    chamf_dist = ChamferDistance()
     neural_network.eval()
 
     with torch.no_grad():
@@ -271,23 +273,32 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
         for i, data in enumerate(tqdm(dataset[test_dataset_slice], desc="Test split", position=0, leave=False)):
             data = data.to(training_device)
             prediction = neural_network(data)
-
-            accuracy_analysis['y'].append_values({
-                'ground_truth': data.y.cpu(),
-                'prediction': prediction.cpu(),
-                'scatter_idx': torch.tensor(i)
+            label_prediction = calc_closest_preds(data.anns_start, data.pos, prediction)
+            # chamf_dist = calc_chamfer_distance((data.pos.cpu() + prediction.cpu()),
+            #                                    data.pos_end.cpu())
+            cd = chamf_dist((data.pos + prediction).unsqueeze(0),
+                             data.pos_end.unsqueeze(0), bidirectional=True,
+                             point_reduction='mean')
+            cd = torch.sqrt(.5 * cd)
+            
+            evaluation.append_values({
+                'disps_gt': data.y.cpu(),
+                'disps_pred': prediction.cpu(),
+                'anns_gt': (data.anns_end - data.anns_start).cpu(),
+                'anns_pred': label_prediction.cpu(),
+                'scatter_idx': torch.tensor(i),
+                'chamf_dist': cd
             })
 
             del data
 
-        print(f"{accuracy_analysis['y'].accuracy_table()}")
-
+        print(f"{evaluation.make_table()}")
+        
         # Qualitative (visual)
         # neural_network.cpu()  # un-comment to avoid memory issues
 
         for idx in tqdm(visualisation_dataset_range, desc="Visualisation split", position=0, leave=False):
             data = dataset.__getitem__(idx).to(training_device)  # avoid "Floating point exception"
-
             data.Y = neural_network(data)
 
             if working_directory and not os.path.exists(working_directory):
@@ -299,6 +310,8 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
             #     'prediction': data.Y,
             #     'clusters': data.scale0_pool_target
             # }).write(os.path.join(working_directory, f"visuals_idx_{idx:04d}.vtu"))
+            save_pred_and_gt_pointclouds(working_directory, data.pos.numpy(),
+                data.y.numpy(), data.Y.numpy(), idx)
 
 
 def ddp_setup(rank, num_gpus, project_name, wandb_config, run_id=None):
