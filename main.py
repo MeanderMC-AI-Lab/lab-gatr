@@ -4,6 +4,7 @@ from lab_gatr.transforms import PointCloudPoolingScales
 import torch_geometric as pyg
 from datasets import Dataset
 import wandb_impostor as wandb
+# import wandb
 from lab_gatr import LaBGATr
 # from lab_gatr.models import LaBVaTr  # geometric algebra ablated LaB-GATr
 import torch
@@ -14,7 +15,7 @@ from tqdm import tqdm
 import statistics
 from torch.nn.parallel import DistributedDataParallel
 from functools import partial
-from utils import Evaluation, calc_closest_preds, calc_chamfer_distance
+from utils import Evaluation, calc_closest_preds, calc_chamfer_distance, EarlyStopping
 import meshio
 import sys
 from time import asctime
@@ -149,17 +150,23 @@ def main(rank, num_gpus):
 
 
 class GeometricAlgebraInterface:
-    num_input_channels = 1  # vertex normals + pos
+    num_input_channels = 3
     num_output_channels = 1
     num_input_scalars = 1
-    num_output_scalars = 1
+    num_output_scalars = None
 
     @staticmethod
     @torch.no_grad()
     def embed(data):
-        multivectors = embed_oriented_plane(normal=data.norm, position=data.pos).view(-1, 1, 16)
-        scalars = torch.zeros(data.pos.shape[0], 1, device=data.pos.device)
-
+        multivectors = torch.cat((
+            embed_point(data.pos).view(-1, 1, 16),
+            embed_oriented_plane(data.norm, data.pos).view(-1, 1, 16),
+            embed_oriented_plane(data.umb_vec, data.pos).view(-1, 1, 16)
+        ), dim=1)
+            
+        # scalars = torch.zeros(data.pos.shape[0], 1, device=data.pos.device)
+        scalars = data.umb_dist.unsqueeze(1)
+        
         return multivectors, scalars
 
     @staticmethod
@@ -196,6 +203,7 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
     load_optimiser_state(rank, optimiser, working_directory)
 
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=optimiser, gamma=wandb.config['lr_decay_gamma'])
+    early_stopping = EarlyStopping(patience=3, min_delta=0.0001)
 
     for epoch in tqdm(range(wandb.config['num_epochs']), desc="Epochs", position=0, leave=True):
 
@@ -239,7 +247,11 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
 
                 del batch, prediction
 
-        wandb.log({key: statistics.mean(value) for key, value in loss_values.items()})
+        wandb.log({key: statistics.mean(value) for key, value in loss_values.items()} | {'epoch': epoch})
+        early_stopping(statistics.mean(loss_values['validation']))
+        if early_stopping.early_stop:
+            print(f"Early stopping training with: {statistics.mean(loss_values['validation']):.4f} (val loss)")
+            break
 
 
 def load_optimiser_state(rank, optimiser, working_directory=""):
@@ -292,6 +304,7 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
 
             del data
 
+        wandb.log(evaluation.get_results())
         print(f"{evaluation.make_table()}")
         
         # Qualitative (visual)
