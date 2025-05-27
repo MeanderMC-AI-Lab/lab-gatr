@@ -2,9 +2,10 @@ from argparse import ArgumentParser
 
 from lab_gatr.transforms import PointCloudPoolingScales
 import torch_geometric as pyg
+from torch.utils.data import Subset
 from datasets import Dataset
-import wandb_impostor as wandb
-# import wandb
+# import wandb_impostor as wandb
+import wandb
 from lab_gatr import LaBGATr
 # from lab_gatr.models import LaBVaTr  # geometric algebra ablated LaB-GATr
 import torch
@@ -18,83 +19,134 @@ from functools import partial
 from utils import Evaluation, calc_closest_preds, calc_chamfer_distance, EarlyStopping
 import meshio
 import sys
+import json
 from time import asctime
 from visualisation import save_pred_and_gt_pointclouds
 from chamferdist import ChamferDistance
+from sklearn.model_selection import KFold
 
 
 parser = ArgumentParser()
+# Run settings
 parser.add_argument('--data_root', type=str, default='/data/Predict-Pneumoperitoneum_LaB-GATr/dataset')
-parser.add_argument('--pooling_mode', type=str, default='cross_attention')  # message_passing, cross_attention
+parser.add_argument('--run_id', type=str, default="sweep")
 parser.add_argument('--num_gpus', type=int, default=1)
-parser.add_argument('--num_epochs', type=int, default=0)
-parser.add_argument('--run_id', type=str, default=None)
+parser.add_argument('--num_folds', type=int, default=1)
+parser.add_argument('--num_epochs', type=int, default=30)
+parser.add_argument('--batch_size', type=int, default=1)
+parser.add_argument('--learning_rate', type=float, default=3e-4)  # best learning rate for Adam, hands down
+parser.add_argument('--lr_decay_gamma', type=float, default=0.9989)
+# Model settings
+parser.add_argument('--interp_simplex', type=str, default='triangle')  # triangle or tetrahedron
+parser.add_argument('--pooling_mode', type=str, default='cross_attention')  # message_passing, cross_attention
+parser.add_argument('--d_model', type=int, default=8)
+parser.add_argument('--num_blocks', type=int, default=10)
+parser.add_argument('--num_attn_heads', type=int, default=4)
 args = parser.parse_args()
+wandb_config = vars(args)
 
 
-wandb_config = {
-    'batch_size': 1,
-    'learning_rate': 3e-4,  # best learning rate for Adam, hands down
-    'num_epochs': args.num_epochs,
-    'lr_decay_gamma': 0.9989,
-    'interp_simplex': 'triangle'  # triangle or tetrahedron
-}
+def make_splits(dataset, num_folds, shuffle, load_from_json=False):
+    if num_folds==1:
+        train_idx = [31, 8, 16, 40, 62, 11, 35, 5, 17, 27, 52, 18, 21, 60, 34, 14, 48, 42, 12, 61, 36, 63, 0,41, 1, 39,
+                     55, 2, 9, 23, 47, 20, 13, 3, 53, 43, 15, 4, 26, 24, 59, 10, 25, 33, 45, 30, 54, 28, 51, 38, 50, 44]
+        val_idx = [58, 32, 49, 6, 64, 57]
+        test_idx = [46, 22, 29, 37, 56, 19, 7]
+        return [(train_idx, val_idx, test_idx)]
+    if load_from_json:
+        assert num_folds in [5, 10]
+        with open("folds.json", "r") as f:
+            fold_idxs = json.load(f)[f"{num_folds}-fold"]
+        with open("map_patient_idx.json", "r") as f:
+            map_idxs = json.load(f)
+        
+        folds = []
+        for fold_id in range(num_folds):
+            train_idx, val_idx, test_idx = [], [], []
+            for n in range(num_folds):
+                patient_idxs = fold_idxs[str(n)]
+                sample_idxs = [map_idxs[str(i)] for i in patient_idxs]
+                if n==fold_id:
+                    test_idx.extend(sample_idxs)
+                elif n==fold_id+1 or (fold_id==num_folds-1 and n==0):
+                    val_idx.extend(sample_idxs)
+                else:
+                    train_idx.extend(sample_idxs)
+            folds.append((train_idx, val_idx, test_idx))
+        return folds
+    else:
+        kfold = KFold(n_splits=num_folds, shuffle=shuffle)  # random_state=42
+        folds = []
+        for (train_idx, test_idx) in kfold.split(dataset):
+            num_val_samples = len(test_idx)            
+            val_idx = train_idx[-num_val_samples:]
+            train_idx = train_idx[:-num_val_samples]
+            folds.append((train_idx, val_idx, test_idx))
+        return folds
 
 
 def main(rank, num_gpus):
-    ddp_setup(rank, num_gpus, project_name="lab_gatr", wandb_config=wandb_config, run_id=args.run_id)
-
+    assert num_gpus == 1
     dataset = Dataset(args.data_root, pre_transform=pyg.transforms.Compose((
         PointCloudPoolingScales(rel_sampling_ratios=(0.01,), interp_simplex=wandb_config['interp_simplex']),
         # positional_encoding
     )))
 
-    # Split: 52 train, 6 validation, 7 test
-    training_data_loader = pyg.loader.DataLoader(
-        dataset[get_dataset_slices_for_gpus(num_gpus, num_samples=52)[rank]],
-        batch_size=wandb.config['batch_size'],
-        shuffle=True
-    )
-    validation_data_loader = pyg.loader.DataLoader(
-        dataset[get_dataset_slices_for_gpus(num_gpus, num_samples=6, first_sample_idx=52)[rank]],
-        batch_size=wandb.config['batch_size'],
-        shuffle=True
-    )
-    test_dataset_slice = slice(58, 65)
-    visualisation_dataset_range = range(58, 65)
+    data_splits = make_splits(dataset, wandb_config['num_folds'], shuffle=True, load_from_json=True)
+    for fold, (train_idx, val_idx, test_idx) in enumerate(data_splits):
+        
+        wandb_config['fold'] = fold
+        print(f"Fold {fold}: {len(train_idx)} (train) {len(val_idx)} (val) {len(test_idx)} (test)")
+        working_dir = os.path.join(f"exp{'-' if args.run_id else ''}{args.run_id or ''}", f"fold{fold}")
+        ddp_setup(rank, num_gpus, project_name="lab_gatr", wandb_config=wandb_config, run_id=args.run_id+f"_fold{fold}")
 
-    neural_network = LaBGATr(GeometricAlgebraInterface, d_model=8, num_blocks=10, num_attn_heads=4, pooling_mode=args.pooling_mode)
-    # neural_network = LaBVaTr(num_input_channels=12, num_output_channels=3, d_model=128, num_blocks=12, num_attn_heads=8)
+        training_data_loader = pyg.loader.DataLoader(
+            # dataset[get_dataset_slices_for_gpus(num_gpus, num_samples=52)[rank]],
+            Subset(dataset, train_idx),
+            batch_size=wandb.config['batch_size'],
+            shuffle=True
+        )
+        validation_data_loader = pyg.loader.DataLoader(
+            # dataset[get_dataset_slices_for_gpus(num_gpus, num_samples=6, first_sample_idx=52)[rank]],
+            Subset(dataset, val_idx),
+            batch_size=wandb.config['batch_size'],
+            shuffle=True
+        )
+        test_dataset_slice = test_idx
+        visualisation_dataset_range = test_idx
 
-    training_device = torch.device(f'cuda:{rank}')
-    neural_network.to(training_device)
-
-    load_neural_network_weights(neural_network, working_directory=f"exp{'-' if args.run_id else ''}{args.run_id or ''}")
-
-    # Distributed data parallel (multi-GPU training)
-    neural_network = ddp_module(neural_network, rank)
-
-    wandb.watch(neural_network)
-    training_loop(
-        rank,
-        neural_network,
-        training_device,
-        training_data_loader,
-        validation_data_loader,
-        working_directory=f"exp{'-' if args.run_id else ''}{args.run_id or ''}"
-    )
-
-    ddp_rank_zero(
-        test_loop,
-        neural_network=neural_network,
-        training_device=training_device,
-        dataset=dataset,
-        test_dataset_slice=test_dataset_slice,
-        visualisation_dataset_range=visualisation_dataset_range,
-        working_directory=f"exp{'-' if args.run_id else ''}{args.run_id or ''}"
-    )
-
-    ddp_cleanup()
+        neural_network = LaBGATr(GeometricAlgebraInterface, d_model=8, num_blocks=10, num_attn_heads=4, pooling_mode=args.pooling_mode)
+        # neural_network = LaBVaTr(num_input_channels=12, num_output_channels=3, d_model=128, num_blocks=12, num_attn_heads=8)
+    
+        training_device = torch.device(f'cuda:{rank}')
+        neural_network.to(training_device)
+    
+        load_neural_network_weights(neural_network, working_directory=working_dir)
+    
+        # Distributed data parallel (multi-GPU training)
+        neural_network = ddp_module(neural_network, rank)
+    
+        wandb.watch(neural_network)
+        training_loop(
+            rank,
+            neural_network,
+            training_device,
+            training_data_loader,
+            validation_data_loader,
+            working_directory=working_dir
+        )
+    
+        ddp_rank_zero(
+            test_loop,
+            neural_network=neural_network,
+            training_device=training_device,
+            dataset=dataset,
+            test_dataset_slice=test_dataset_slice,
+            visualisation_dataset_range=visualisation_dataset_range,
+            working_directory=working_dir
+        )
+    
+        ddp_cleanup()
 
 
 # @torch.no_grad()
@@ -310,6 +362,8 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
         # Qualitative (visual)
         # neural_network.cpu()  # un-comment to avoid memory issues
 
+        # Commented-out to avoid plotting a lot during sweeping
+        """
         for idx in tqdm(visualisation_dataset_range, desc="Visualisation split", position=0, leave=False):
             data = dataset.__getitem__(idx).to(training_device)  # avoid "Floating point exception"
             data.Y = neural_network(data)
@@ -325,6 +379,7 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
             # }).write(os.path.join(working_directory, f"visuals_idx_{idx:04d}.vtu"))
             save_pred_and_gt_pointclouds(working_directory, data.pos.numpy(),
                 data.y.numpy(), data.Y.numpy(), idx)
+        """
 
 
 def ddp_setup(rank, num_gpus, project_name, wandb_config, run_id=None):
