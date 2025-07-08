@@ -42,6 +42,7 @@ class Dataset(pyg.data.Dataset):
         input_points = datafile['input_points'].float()
         umb_dists = input_points.norm(dim=1)
         umb_vecs = -input_points / umb_dists.clamp(min=1e-8).unsqueeze(1)
+        long_pos = input_points[:, 1]
         
         data = Data(
             y = datafile['displacements'].float(),               # NeuralODE displacement samples
@@ -52,7 +53,8 @@ class Dataset(pyg.data.Dataset):
             anns_end = datafile['annotations_end'].float(),      # Labelled locations on insufflated abdomen
             pos_end = datafile['target_points'].float(),         # Measured pointcloud after insufflation
             umb_dist = umb_dists,                                # Distance from the umbilicus
-            umb_vec = umb_vecs                                   # Unit vector in the direction of the umbilicus
+            umb_vec = umb_vecs,                                  # Unit vector in the direction of the umbilicus
+            long_pos = long_pos                                  # Scalar as position on longitudinal axis
         )
         return data
 

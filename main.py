@@ -36,12 +36,13 @@ parser.add_argument('--num_epochs', type=int, default=30)
 parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--learning_rate', type=float, default=3e-4)  # best learning rate for Adam, hands down
 parser.add_argument('--lr_decay_gamma', type=float, default=0.9989)
+parser.add_argument('--loss', type=str, choices=['l1', 'l2', 'chamfer'], default='l1')
 # Model settings
-parser.add_argument('--interp_simplex', type=str, default='triangle')  # triangle or tetrahedron
+parser.add_argument('--interp_simplex', type=str, default='tetrahedron')  # triangle or tetrahedron
 parser.add_argument('--pooling_mode', type=str, default='cross_attention')  # message_passing, cross_attention
 parser.add_argument('--d_model', type=int, default=8)
-parser.add_argument('--num_blocks', type=int, default=10)
-parser.add_argument('--num_attn_heads', type=int, default=4)
+parser.add_argument('--num_blocks', type=int, default=12)
+parser.add_argument('--num_attn_heads', type=int, default=8)
 args = parser.parse_args()
 wandb_config = vars(args)
 
@@ -204,7 +205,7 @@ def main(rank, num_gpus):
 class GeometricAlgebraInterface:
     num_input_channels = 3
     num_output_channels = 1
-    num_input_scalars = 1
+    num_input_scalars = 2  #1
     num_output_scalars = None
 
     @staticmethod
@@ -217,7 +218,11 @@ class GeometricAlgebraInterface:
         ), dim=1)
             
         # scalars = torch.zeros(data.pos.shape[0], 1, device=data.pos.device)
-        scalars = data.umb_dist.unsqueeze(1)
+        # scalars = data.umb_dist.unsqueeze(1)
+        scalars = torch.cat((
+            data.umb_dist.unsqueeze(1),
+            data.long_pos.unsqueeze(1)
+        ), dim=1)
         
         return multivectors, scalars
 
@@ -249,7 +254,8 @@ def load_neural_network_weights(neural_network, working_directory=""):
 
 def training_loop(rank, neural_network, training_device, training_data_loader, validation_data_loader, working_directory):
 
-    loss_function = torch.nn.L1Loss()
+    loss_options = {'l1': torch.nn.L1Loss(), 'l2': torch.nn.MSELoss(), 'chamfer': ChamferDistance()}
+    loss_function = loss_options[args.loss]
 
     optimiser = torch.optim.Adam(neural_network.parameters(), lr=wandb.config['learning_rate'])
     load_optimiser_state(rank, optimiser, working_directory)
@@ -270,9 +276,18 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
             batch = batch.to(training_device)
             prediction = neural_network(batch)
 
-            loss_value = loss_function(prediction, batch.y)
+            if args.loss in ['l1', 'l2']:
+                loss_value = loss_function(prediction, batch.y)
+            else:
+                loss_value = loss_function(
+                    (batch.pos + prediction).unsqueeze(0),
+                    batch.pos_end.unsqueeze(0),
+                    bidirectional=True,
+                    point_reduction='mean'
+                )
+                # loss_value = torch.sqrt(.5 * loss_value)
+            
             loss_values['training'].append(loss_value.item())
-
             loss_value.backward()  # "autograd" hook fires and triggers gradient synchronisation across processes
             torch.nn.utils.clip_grad_norm_(neural_network.parameters(), max_norm=1.0, error_if_nonfinite=True)
 
@@ -282,8 +297,9 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
 
         scheduler.step()
 
-        ddp_rank_zero(save_neural_network_weights, neural_network, working_directory)
-        torch.save(optimiser.state_dict(), os.path.join(working_directory, f"rank_{rank}_optimiser_state.pt"))
+        if args.run_id != "sweep":
+            ddp_rank_zero(save_neural_network_weights, neural_network, working_directory)
+            torch.save(optimiser.state_dict(), os.path.join(working_directory, f"rank_{rank}_optimiser_state.pt"))
 
         # Learning task
         neural_network.eval()
@@ -293,8 +309,18 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
 
                 batch = batch.to(training_device)
                 prediction = neural_network(batch)
+                target = batch.y if args.loss in ['l1', 'l2'] else batch.pos_end
 
-                loss_value = loss_function(prediction, batch.y)
+                if args.loss in ['l1', 'l2']:
+                    loss_value = loss_function(prediction, batch.y)
+                else:
+                    loss_value = loss_function(
+                        (batch.pos + prediction).unsqueeze(0),
+                        batch.pos_end.unsqueeze(0),
+                        bidirectional=True,
+                        point_reduction='mean'
+                    )
+                    # loss_value = torch.sqrt(.5 * loss_value)
                 loss_values['validation'].append(loss_value.item())
 
                 del batch, prediction
@@ -361,25 +387,22 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
         
         # Qualitative (visual)
         # neural_network.cpu()  # un-comment to avoid memory issues
-
-        # Commented-out to avoid plotting a lot during sweeping
-        """
-        for idx in tqdm(visualisation_dataset_range, desc="Visualisation split", position=0, leave=False):
-            data = dataset.__getitem__(idx).to(training_device)  # avoid "Floating point exception"
-            data.Y = neural_network(data)
-
-            if working_directory and not os.path.exists(working_directory):
-                os.makedirs(working_directory)
-
-            data.cpu()
-            # meshio.Mesh(data.pos, [('tetra', data.tets.T)], point_data={
-            #     'reference': data.y,
-            #     'prediction': data.Y,
-            #     'clusters': data.scale0_pool_target
-            # }).write(os.path.join(working_directory, f"visuals_idx_{idx:04d}.vtu"))
-            save_pred_and_gt_pointclouds(working_directory, data.pos.numpy(),
-                data.y.numpy(), data.Y.numpy(), idx)
-        """
+        if args.run_id != "sweep":
+            for idx in tqdm(visualisation_dataset_range, desc="Visualisation split", position=0, leave=False):
+                data = dataset.__getitem__(idx).to(training_device)  # avoid "Floating point exception"
+                data.Y = neural_network(data)
+    
+                if working_directory and not os.path.exists(working_directory):
+                    os.makedirs(working_directory)
+    
+                data.cpu()
+                # meshio.Mesh(data.pos, [('tetra', data.tets.T)], point_data={
+                #     'reference': data.y,
+                #     'prediction': data.Y,
+                #     'clusters': data.scale0_pool_target
+                # }).write(os.path.join(working_directory, f"visuals_idx_{idx:04d}.vtu"))
+                save_pred_and_gt_pointclouds(working_directory, data.pos.numpy(),
+                    data.y.numpy(), data.Y.numpy(), idx)
 
 
 def ddp_setup(rank, num_gpus, project_name, wandb_config, run_id=None):
