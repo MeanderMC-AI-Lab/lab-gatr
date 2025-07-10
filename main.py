@@ -4,10 +4,9 @@ from lab_gatr.transforms import PointCloudPoolingScales
 import torch_geometric as pyg
 from torch.utils.data import Subset
 from datasets import Dataset
-# import wandb_impostor as wandb
-import wandb
+import wandb_impostor as wandb
+# import wandb
 from lab_gatr import LaBGATr
-# from lab_gatr.models import LaBVaTr  # geometric algebra ablated LaB-GATr
 import torch
 from torch_cluster import knn
 from gatr.interface import embed_point, embed_oriented_plane, extract_oriented_plane, extract_translation
@@ -24,6 +23,23 @@ from time import asctime
 from visualisation import save_pred_and_gt_pointclouds
 from chamferdist import ChamferDistance
 from sklearn.model_selection import KFold
+from lab_gatr.nn.mlp.vanilla import MLP
+from torch_dvf.models import PointNet, SEPointNet
+from torch_dvf.transforms import RadiusPointCloudHierarchy
+from e3nn import o3
+
+
+def calculate_inputs():
+    multivectors = 0
+    scalars = 0
+    if args.feat_norm:
+        multivectors += 1
+    if args.feat_umbilicus:
+        multivectors += 1
+        scalars += 1
+    if args.feat_longitudinal:
+        scalars += 1
+    return multivectors, scalars
 
 
 parser = ArgumentParser()
@@ -36,24 +52,77 @@ parser.add_argument('--num_epochs', type=int, default=30)
 parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--learning_rate', type=float, default=3e-4)  # best learning rate for Adam, hands down
 parser.add_argument('--lr_decay_gamma', type=float, default=0.9989)
-parser.add_argument('--loss', type=str, choices=['l1', 'l2', 'chamfer'], default='l1')
+parser.add_argument('--loss', type=str, choices=['l1', 'l2', 'chamfer'], default='l2')
 # Model settings
-parser.add_argument('--interp_simplex', type=str, default='tetrahedron')  # triangle or tetrahedron
-parser.add_argument('--pooling_mode', type=str, default='cross_attention')  # message_passing, cross_attention
+parser.add_argument('--rel_sampling_ratio', type=float, default=0.01)
+parser.add_argument('--model', type=str, choices=['labgatr', 'pointnet', 'sepointnet', 'mlp'], default='labgatr')
+parser.add_argument('--interp_simplex', type=str, choices=['triangle', 'tetrahedron'], default='tetrahedron')
+parser.add_argument('--pooling_mode', type=str, choices=['message_passing', 'cross_attention'], default='cross_attention')
 parser.add_argument('--d_model', type=int, default=8)
 parser.add_argument('--num_blocks', type=int, default=12)
 parser.add_argument('--num_attn_heads', type=int, default=8)
+parser.add_argument('--num_latent_channels', type=int, default=32)
+# Features settings
+parser.add_argument('--feat_norm', action='store_true')
+parser.add_argument('--feat_umbilicus', action='store_true')
+parser.add_argument('--feat_longitudinal', action='store_true')
 args = parser.parse_args()
 wandb_config = vars(args)
+# Calculate number of point features
+args.multivectors, args.scalars = calculate_inputs()
+args.num_input_channels = args.multivectors * 3 + args.scalars
+
+
+@torch.no_grad()
+def positional_encoding(data):
+    features = []
+    if args.feat_norm:
+        features.append(data.norm)
+    if args.feat_umbilicus:
+        features.append(data.umb_vec)
+        features.append(data.umb_dist.unsqueeze(1))
+    if args.feat_longitudinal:
+        features.append(data.long_pos.unsqueeze(1))
+    data.x = torch.cat(features, dim=1)
+    return data
+
+
+class GeometricAlgebraInterface:
+    num_input_channels = args.multivectors + 1  # Add one for data.pos
+    num_input_scalars = args.scalars if args.scalars > 0 else 1
+    num_output_channels = 1
+    num_output_scalars = None
+
+    @staticmethod
+    @torch.no_grad()
+    def embed(data):
+        multivectors = torch.cat((
+            embed_point(data.pos).view(-1, 1, 16),
+            *(embed_oriented_plane(data.x[:, slice(i * 3, i * 3 + 3)], data.pos).view(-1, 1, 16) for i in range(args.multivectors))
+        ), dim=1)
+        if args.scalars == 0:
+            scalars = torch.zeros(data.pos.shape[0], 1, device=data.pos.device)  # scalars cannot be None, so inputting zeros instead
+        else:
+            scalars = data.x[:, args.multivectors*3:]
+        return multivectors, scalars
+
+    @staticmethod
+    def dislodge(multivectors, scalars):
+        output = extract_oriented_plane(multivectors).squeeze()
+        return output
 
 
 def make_splits(dataset, num_folds, shuffle, load_from_json=False):
+    # Single fold
     if num_folds==1:
-        train_idx = [31, 8, 16, 40, 62, 11, 35, 5, 17, 27, 52, 18, 21, 60, 34, 14, 48, 42, 12, 61, 36, 63, 0,41, 1, 39,
-                     55, 2, 9, 23, 47, 20, 13, 3, 53, 43, 15, 4, 26, 24, 59, 10, 25, 33, 45, 30, 54, 28, 51, 38, 50, 44]
+        train_idx = [31, 8, 16, 40, 62, 11, 35, 5, 17, 27, 52, 18, 21, 60, 34, 14, 48, 42, 12, 61,
+                     36, 63, 0, 41, 1, 39, 55, 2, 9, 23, 47, 20, 13, 3, 53, 43, 15, 4, 26, 24,
+                     59, 10, 25, 33, 45, 30, 54, 28, 51, 38, 50, 44]
         val_idx = [58, 32, 49, 6, 64, 57]
         test_idx = [46, 22, 29, 37, 56, 19, 7]
         return [(train_idx, val_idx, test_idx)]
+
+    # Load predefined folds from json file
     if load_from_json:
         assert num_folds in [5, 10]
         with open("folds.json", "r") as f:
@@ -75,6 +144,8 @@ def make_splits(dataset, num_folds, shuffle, load_from_json=False):
                     train_idx.extend(sample_idxs)
             folds.append((train_idx, val_idx, test_idx))
         return folds
+
+    # Create folds randomly
     else:
         kfold = KFold(n_splits=num_folds, shuffle=shuffle)  # random_state=42
         folds = []
@@ -86,29 +157,112 @@ def make_splits(dataset, num_folds, shuffle, load_from_json=False):
         return folds
 
 
+def select_model(model_type):
+    if model_type == 'labgatr':
+        return LaBGATr(
+            GeometricAlgebraInterface,
+            d_model = args.d_model,
+            num_blocks = args.num_blocks,
+            num_attn_heads = args.num_attn_heads,
+            pooling_mode = args.pooling_mode
+        )
+    if model_type == 'pointnet':
+        return PointNet(
+            num_input_channels = args.num_input_channels,
+            num_output_channels = 3,
+            num_hierarchies = 1,
+            num_latent_channels = args.num_latent_channels
+        )
+    if model_type == 'sepointnet':
+        input_irreps = ""
+        if args.multivectors > 0:
+            input_irreps = f"{args.multivectors}x1o"
+            if args.scalars > 0:
+                input_irreps += "+"
+        if args.scalars > 0:
+            input_irreps += f"{args.scalars}x0e"
+        return SEPointNet(
+            o3.Irreps(input_irreps),
+            o3.Irreps("1x1o"),
+            num_hierarchies = 1,
+            num_latent_channels = args.num_latent_channels
+        )
+    else:
+        channels_in = args.num_input_channels + 3
+        return MLP(
+            (channels_in, 512, 512, 512, 512, 512, 512, 3),
+            plain_last = True,
+            use_norm_in_first = True,
+            dropout_probability = False,
+            use_running_stats_in_norm = True
+        )
+
+def select_transform(model_type):
+    if model_type in ['labgatr']:
+        return pyg.transforms.Compose((
+            PointCloudPoolingScales(
+                rel_sampling_ratios = (args.rel_sampling_ratio,),
+                interp_simplex = args.interp_simplex
+            ),
+            positional_encoding
+        ))
+    if model_type in ['pointnet', 'sepointnet']:
+        return pyg.transforms.Compose((
+            RadiusPointCloudHierarchy(
+                rel_sampling_ratios = (args.rel_sampling_ratio,),
+                cluster_radii = None,
+                interp_simplex = args.interp_simplex
+            ),
+            positional_encoding
+        ))
+    else:
+        return None
+
+
+class L2Loss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mse = torch.nn.MSELoss()
+        
+    def forward(self, yhat, y):
+        return torch.sqrt(self.mse(yhat, y) + 1e-8)
+
+
+class ChamferLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.chamfer = ChamferDistance()
+
+    def forward(self, yhat, y):
+        loss = self.chamfer(yhat, y, bidirectional=True, point_reduction='mean')
+        return torch.sqrt(.5 * loss)
+
+
 def main(rank, num_gpus):
     assert num_gpus == 1
-    dataset = Dataset(args.data_root, pre_transform=pyg.transforms.Compose((
-        PointCloudPoolingScales(rel_sampling_ratios=(0.01,), interp_simplex=wandb_config['interp_simplex']),
-        # positional_encoding
-    )))
 
+    # Build dataset with folds for cross-validation
+    transform = select_transform(args.model)
+    dataset = Dataset(args.data_root, pre_transform=transform)
     data_splits = make_splits(dataset, wandb_config['num_folds'], shuffle=True, load_from_json=True)
+    
     for fold, (train_idx, val_idx, test_idx) in enumerate(data_splits):
-        
+
+        # Setup fold
         wandb_config['fold'] = fold
         print(f"Fold {fold}: {len(train_idx)} (train) {len(val_idx)} (val) {len(test_idx)} (test)")
         working_dir = os.path.join(f"exp{'-' if args.run_id else ''}{args.run_id or ''}", f"fold{fold}")
-        ddp_setup(rank, num_gpus, project_name="lab_gatr", wandb_config=wandb_config, run_id=args.run_id+f"_fold{fold}")
+        ddp_setup(rank, num_gpus, project_name="lab_gatr", wandb_config=wandb_config,
+                  run_id=args.run_id+f"_fold{fold}")
+        training_device = torch.device(f'cuda:{rank}')
 
+        # Make train and validation dataloaders
         training_data_loader = pyg.loader.DataLoader(
-            # dataset[get_dataset_slices_for_gpus(num_gpus, num_samples=52)[rank]],
             Subset(dataset, train_idx),
             batch_size=wandb.config['batch_size'],
             shuffle=True
         )
         validation_data_loader = pyg.loader.DataLoader(
-            # dataset[get_dataset_slices_for_gpus(num_gpus, num_samples=6, first_sample_idx=52)[rank]],
             Subset(dataset, val_idx),
             batch_size=wandb.config['batch_size'],
             shuffle=True
@@ -116,17 +270,15 @@ def main(rank, num_gpus):
         test_dataset_slice = test_idx
         visualisation_dataset_range = test_idx
 
-        neural_network = LaBGATr(GeometricAlgebraInterface, d_model=8, num_blocks=10, num_attn_heads=4, pooling_mode=args.pooling_mode)
-        # neural_network = LaBVaTr(num_input_channels=12, num_output_channels=3, d_model=128, num_blocks=12, num_attn_heads=8)
-    
-        training_device = torch.device(f'cuda:{rank}')
+        # Build neural network and load weights
+        neural_network = select_model(args.model)
         neural_network.to(training_device)
-    
         load_neural_network_weights(neural_network, working_directory=working_dir)
     
         # Distributed data parallel (multi-GPU training)
         neural_network = ddp_module(neural_network, rank)
-    
+
+        # Training and validation
         wandb.watch(neural_network)
         training_loop(
             rank,
@@ -136,7 +288,8 @@ def main(rank, num_gpus):
             validation_data_loader,
             working_directory=working_dir
         )
-    
+
+        # Testing
         ddp_rank_zero(
             test_loop,
             neural_network=neural_network,
@@ -148,90 +301,6 @@ def main(rank, num_gpus):
         )
     
         ddp_cleanup()
-
-
-# @torch.no_grad()
-# def positional_encoding(data):
-
-#     vectors_to = {key: data.pos[value.long()] - data.pos for key, value in compute_nearest_boundary_vertex(data).items()}
-#     distances_to = {key: torch.linalg.norm(value, dim=-1, keepdim=True) for key, value in vectors_to.items()}
-
-#     data.x = torch.cat((
-#         vectors_to['inlet'] / torch.clamp(distances_to['inlet'], min=1e-16),
-#         vectors_to['lumen_wall'] / torch.clamp(distances_to['lumen_wall'], min=1e-16),
-#         vectors_to['outlets'] / torch.clamp(distances_to['outlets'], min=1e-16),
-#         distances_to['inlet'],
-#         distances_to['lumen_wall'],
-#         distances_to['outlets']
-#     ), dim=1)
-
-#     return data
-
-
-# def compute_nearest_boundary_vertex(data):
-#     index_dict = {}
-
-#     for key in ('inlet', 'lumen_wall', 'outlets'):
-#         index_dict[key] = data[f'{key}_index'][knn(data.pos[data[f'{key}_index'].long()], data.pos, k=1)[1].long()]
-
-#     return index_dict
-
-
-# class GeometricAlgebraInterface:
-#     num_input_channels = 1 + 3  # vertex positions plus positional encoding vectors
-#     num_output_channels = 1
-
-#     num_input_scalars = 3  # positional encoding sclars
-#     num_output_scalars = None
-
-#     @staticmethod
-#     @torch.no_grad()
-#     def embed(data):
-
-#         multivectors = torch.cat((
-#             embed_point(data.pos).view(-1, 1, 16),
-#             *(embed_oriented_plane(data.x[:, slice(i * 3, i * 3 + 3)], data.pos).view(-1, 1, 16) for i in range(3))
-#         ), dim=1)
-#         scalars = data.x[:, 9:]
-
-#         return multivectors, scalars
-
-#     @staticmethod
-#     def dislodge(multivectors, scalars):
-#         return extract_oriented_plane(multivectors).squeeze()
-
-
-
-class GeometricAlgebraInterface:
-    num_input_channels = 3
-    num_output_channels = 1
-    num_input_scalars = 2  #1
-    num_output_scalars = None
-
-    @staticmethod
-    @torch.no_grad()
-    def embed(data):
-        multivectors = torch.cat((
-            embed_point(data.pos).view(-1, 1, 16),
-            embed_oriented_plane(data.norm, data.pos).view(-1, 1, 16),
-            embed_oriented_plane(data.umb_vec, data.pos).view(-1, 1, 16)
-        ), dim=1)
-            
-        # scalars = torch.zeros(data.pos.shape[0], 1, device=data.pos.device)
-        # scalars = data.umb_dist.unsqueeze(1)
-        scalars = torch.cat((
-            data.umb_dist.unsqueeze(1),
-            data.long_pos.unsqueeze(1)
-        ), dim=1)
-        
-        return multivectors, scalars
-
-    @staticmethod
-    def dislodge(multivectors, scalars):
-        output = extract_oriented_plane(multivectors).squeeze()
-        # output = extract_translation(multivectors).squeeze()
-
-        return output
 
 
 def get_dataset_slices_for_gpus(num_gpus, num_samples, first_sample_idx=0):
@@ -254,7 +323,7 @@ def load_neural_network_weights(neural_network, working_directory=""):
 
 def training_loop(rank, neural_network, training_device, training_data_loader, validation_data_loader, working_directory):
 
-    loss_options = {'l1': torch.nn.L1Loss(), 'l2': torch.nn.MSELoss(), 'chamfer': ChamferDistance()}
+    loss_options = {'l1': torch.nn.L1Loss(), 'l2': L2Loss(), 'chamfer': ChamferLoss()}
     loss_function = loss_options[args.loss]
 
     optimiser = torch.optim.Adam(neural_network.parameters(), lr=wandb.config['learning_rate'])
@@ -274,23 +343,20 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
             optimiser.zero_grad()
 
             batch = batch.to(training_device)
-            prediction = neural_network(batch)
-
+            if args.model == 'mlp':
+                prediction = neural_network(torch.cat([batch.pos, batch.x], dim=1))
+            else:
+                prediction = neural_network(batch)
+                
             if args.loss in ['l1', 'l2']:
                 loss_value = loss_function(prediction, batch.y)
             else:
-                loss_value = loss_function(
-                    (batch.pos + prediction).unsqueeze(0),
-                    batch.pos_end.unsqueeze(0),
-                    bidirectional=True,
-                    point_reduction='mean'
-                )
-                # loss_value = torch.sqrt(.5 * loss_value)
+                loss_value = loss_function((batch.pos + prediction).unsqueeze(0),
+                                           batch.pos_end.unsqueeze(0))
             
             loss_values['training'].append(loss_value.item())
             loss_value.backward()  # "autograd" hook fires and triggers gradient synchronisation across processes
             torch.nn.utils.clip_grad_norm_(neural_network.parameters(), max_norm=1.0, error_if_nonfinite=True)
-
             optimiser.step()
 
             del batch, prediction
@@ -308,19 +374,17 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
             for batch in tqdm(validation_data_loader, desc="Validation split", position=1, leave=False):
 
                 batch = batch.to(training_device)
-                prediction = neural_network(batch)
+                if args.model == 'mlp':
+                    prediction = neural_network(torch.cat([batch.pos, batch.x], dim=1))
+                else:
+                    prediction = neural_network(batch)
                 target = batch.y if args.loss in ['l1', 'l2'] else batch.pos_end
 
                 if args.loss in ['l1', 'l2']:
                     loss_value = loss_function(prediction, batch.y)
                 else:
-                    loss_value = loss_function(
-                        (batch.pos + prediction).unsqueeze(0),
-                        batch.pos_end.unsqueeze(0),
-                        bidirectional=True,
-                        point_reduction='mean'
-                    )
-                    # loss_value = torch.sqrt(.5 * loss_value)
+                    loss_value = loss_function((batch.pos + prediction).unsqueeze(0),
+                                               batch.pos_end.unsqueeze(0))
                 loss_values['validation'].append(loss_value.item())
 
                 del batch, prediction
@@ -354,7 +418,7 @@ def save_neural_network_weights(neural_network, working_directory="", file_name=
 
 def test_loop(neural_network, training_device, dataset, test_dataset_slice, visualisation_dataset_range, working_directory):
     evaluation = Evaluation()
-    chamf_dist = ChamferDistance()
+    chamfer_loss = ChamferLoss()
     neural_network.eval()
 
     with torch.no_grad():
@@ -362,14 +426,13 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
         # Quantitative
         for i, data in enumerate(tqdm(dataset[test_dataset_slice], desc="Test split", position=0, leave=False)):
             data = data.to(training_device)
-            prediction = neural_network(data)
+            if args.model == 'mlp':
+                prediction = neural_network(torch.cat([data.pos, data.x], dim=1))
+            else:
+                prediction = neural_network(batch)
             label_prediction = calc_closest_preds(data.anns_start, data.pos, prediction)
-            # chamf_dist = calc_chamfer_distance((data.pos.cpu() + prediction.cpu()),
-            #                                    data.pos_end.cpu())
-            cd = chamf_dist((data.pos + prediction).unsqueeze(0),
-                             data.pos_end.unsqueeze(0), bidirectional=True,
-                             point_reduction='mean')
-            cd = torch.sqrt(.5 * cd)
+            chamfer = chamfer_loss((data.pos + prediction).unsqueeze(0),
+                                   data.pos_end.unsqueeze(0))
             
             evaluation.append_values({
                 'disps_gt': data.y.cpu(),
@@ -377,7 +440,7 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
                 'anns_gt': (data.anns_end - data.anns_start).cpu(),
                 'anns_pred': label_prediction.cpu(),
                 'scatter_idx': torch.tensor(i),
-                'chamf_dist': cd
+                'chamf_dist': chamfer
             })
 
             del data
@@ -390,17 +453,15 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
         if args.run_id != "sweep":
             for idx in tqdm(visualisation_dataset_range, desc="Visualisation split", position=0, leave=False):
                 data = dataset.__getitem__(idx).to(training_device)  # avoid "Floating point exception"
-                data.Y = neural_network(data)
+                if args.model == 'mlp':
+                    data.Y = neural_network(torch.cat([data.pos, data.x], dim=1))
+                else:
+                    data.Y = neural_network(data)
     
                 if working_directory and not os.path.exists(working_directory):
                     os.makedirs(working_directory)
     
                 data.cpu()
-                # meshio.Mesh(data.pos, [('tetra', data.tets.T)], point_data={
-                #     'reference': data.y,
-                #     'prediction': data.Y,
-                #     'clusters': data.scale0_pool_target
-                # }).write(os.path.join(working_directory, f"visuals_idx_{idx:04d}.vtu"))
                 save_pred_and_gt_pointclouds(working_directory, data.pos.numpy(),
                     data.y.numpy(), data.Y.numpy(), idx)
 
@@ -437,10 +498,8 @@ def ddp_rank_zero(fun, *args, **kwargs):
 
 
 def ddp_cleanup():
-
     wandb.finish()
     torch.distributed.destroy_process_group() if torch.distributed.is_initialized() else None
-
     sys.stderr.close() if torch.distributed.is_initialized() else None  # last executed statement
 
 
