@@ -1,11 +1,10 @@
+import wandb_impostor as wandb
+# import wandb
 from argparse import ArgumentParser
-
 from lab_gatr.transforms import PointCloudPoolingScales
 import torch_geometric as pyg
 from torch.utils.data import Subset
 from datasets import Dataset
-import wandb_impostor as wandb
-# import wandb
 from lab_gatr import LaBGATr
 import torch
 from torch_cluster import knn
@@ -39,6 +38,8 @@ def calculate_inputs():
         scalars += 1
     if args.feat_longitudinal:
         scalars += 1
+    if args.feat_patient:
+        scalars += 5
     return multivectors, scalars
 
 
@@ -52,20 +53,21 @@ parser.add_argument('--num_epochs', type=int, default=30)
 parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--learning_rate', type=float, default=3e-4)  # best learning rate for Adam, hands down
 parser.add_argument('--lr_decay_gamma', type=float, default=0.9989)
-parser.add_argument('--loss', type=str, choices=['l1', 'l2', 'chamfer'], default='l2')
+parser.add_argument('--loss', type=str, choices=['l1', 'l2', 'chamfer'], default='chamfer')
 # Model settings
-parser.add_argument('--rel_sampling_ratio', type=float, default=0.01)
+parser.add_argument('--rel_sampling_ratio', type=float, default=0.05)  # Works for LaB-GATr only
 parser.add_argument('--model', type=str, choices=['labgatr', 'pointnet', 'sepointnet', 'mlp'], default='labgatr')
 parser.add_argument('--interp_simplex', type=str, choices=['triangle', 'tetrahedron'], default='tetrahedron')
 parser.add_argument('--pooling_mode', type=str, choices=['message_passing', 'cross_attention'], default='cross_attention')
-parser.add_argument('--d_model', type=int, default=8)
-parser.add_argument('--num_blocks', type=int, default=12)
-parser.add_argument('--num_attn_heads', type=int, default=8)
-parser.add_argument('--num_latent_channels', type=int, default=32)
+parser.add_argument('--d_model', type=int, default=8)  # LaB-GATr
+parser.add_argument('--num_blocks', type=int, default=10)  # LaB-GATr
+parser.add_argument('--num_attn_heads', type=int, default=4)  # LaB-GATr
+parser.add_argument('--num_latent_channels', type=int, default=256)  # PointNet++
 # Features settings
 parser.add_argument('--feat_norm', action='store_true')
 parser.add_argument('--feat_umbilicus', action='store_true')
 parser.add_argument('--feat_longitudinal', action='store_true')
+parser.add_argument('--feat_patient', action='store_true')
 args = parser.parse_args()
 wandb_config = vars(args)
 # Calculate number of point features
@@ -83,7 +85,10 @@ def positional_encoding(data):
         features.append(data.umb_dist.unsqueeze(1))
     if args.feat_longitudinal:
         features.append(data.long_pos.unsqueeze(1))
-    data.x = torch.cat(features, dim=1)
+    if args.feat_patient:
+        features.append(data.pt_feat)
+    data.x = torch.cat(features, dim=1) if features else \
+        torch.empty((data.pos.shape[0], 0), device=data.pos.device)
     return data
 
 
@@ -170,7 +175,7 @@ def select_model(model_type):
         return PointNet(
             num_input_channels = args.num_input_channels,
             num_output_channels = 3,
-            num_hierarchies = 1,
+            num_hierarchies = 4,
             num_latent_channels = args.num_latent_channels
         )
     if model_type == 'sepointnet':
@@ -184,7 +189,7 @@ def select_model(model_type):
         return SEPointNet(
             o3.Irreps(input_irreps),
             o3.Irreps("1x1o"),
-            num_hierarchies = 1,
+            num_hierarchies = 4,
             num_latent_channels = args.num_latent_channels
         )
     else:
@@ -209,14 +214,14 @@ def select_transform(model_type):
     if model_type in ['pointnet', 'sepointnet']:
         return pyg.transforms.Compose((
             RadiusPointCloudHierarchy(
-                rel_sampling_ratios = (args.rel_sampling_ratio,),
+                rel_sampling_ratios = (.05, .5, .75, .9),
                 cluster_radii = None,
                 interp_simplex = args.interp_simplex
             ),
             positional_encoding
         ))
     else:
-        return None
+        return positional_encoding
 
 
 class L2Loss(torch.nn.Module):
@@ -249,11 +254,11 @@ def main(rank, num_gpus):
     for fold, (train_idx, val_idx, test_idx) in enumerate(data_splits):
 
         # Setup fold
+        run_name = f"{args.model}_{args.run_id}_fold{fold}"
         wandb_config['fold'] = fold
         print(f"Fold {fold}: {len(train_idx)} (train) {len(val_idx)} (val) {len(test_idx)} (test)")
-        working_dir = os.path.join(f"exp{'-' if args.run_id else ''}{args.run_id or ''}", f"fold{fold}")
-        ddp_setup(rank, num_gpus, project_name="lab_gatr", wandb_config=wandb_config,
-                  run_id=args.run_id+f"_fold{fold}")
+        working_dir = os.path.join("runs", args.model, f"exp-{args.run_id}", f"fold{fold}")
+        ddp_setup(rank, num_gpus, project_name="lab_gatr", wandb_config=wandb_config, run_id=run_name)
         training_device = torch.device(f'cuda:{rank}')
 
         # Make train and validation dataloaders
@@ -317,7 +322,7 @@ def get_dataset_slices_for_gpus(num_gpus, num_samples, first_sample_idx=0):
 def load_neural_network_weights(neural_network, working_directory=""):
     if os.path.exists(os.path.join(working_directory, "neural_network_weights.pt")):
 
-        neural_network.load_state_dict(torch.load(os.path.join(working_directory, "neural_network_weights.pt")))
+        neural_network.load_state_dict(torch.load(os.path.join(working_directory, "neural_network_weights.pt"), weights_only=False))
         print("Resuming from pre-trained neural-network weights.")
 
 
@@ -379,7 +384,7 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
                 else:
                     prediction = neural_network(batch)
                 target = batch.y if args.loss in ['l1', 'l2'] else batch.pos_end
-
+                
                 if args.loss in ['l1', 'l2']:
                     loss_value = loss_function(prediction, batch.y)
                 else:
@@ -399,7 +404,7 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
 def load_optimiser_state(rank, optimiser, working_directory=""):
     if os.path.exists(os.path.join(working_directory, f"rank_{rank}_optimiser_state.pt")):
 
-        optimiser.load_state_dict(torch.load(os.path.join(working_directory, f"rank_{rank}_optimiser_state.pt")))
+        optimiser.load_state_dict(torch.load(os.path.join(working_directory, f"rank_{rank}_optimiser_state.pt"), weights_only=False))
         print("Resuming from previous optimiser state.")
 
 
@@ -429,7 +434,7 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
             if args.model == 'mlp':
                 prediction = neural_network(torch.cat([data.pos, data.x], dim=1))
             else:
-                prediction = neural_network(batch)
+                prediction = neural_network(data)
             label_prediction = calc_closest_preds(data.anns_start, data.pos, prediction)
             chamfer = chamfer_loss((data.pos + prediction).unsqueeze(0),
                                    data.pos_end.unsqueeze(0))

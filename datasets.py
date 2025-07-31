@@ -43,12 +43,14 @@ class Dataset(pyg.data.Dataset):
         umb_dists = input_points.norm(dim=1)
         umb_vecs = -input_points / umb_dists.clamp(min=1e-8).unsqueeze(1)
         long_pos = input_points[:, 1]
+        num_points = input_points.shape[0]
+        pt_feat = datafile['patient_features'].float().unsqueeze(0).repeat(num_points, 1)
         
         data = Data(
             y = datafile['displacements'].float(),               # NeuralODE displacement samples
             pos = input_points,                                  # Measured pointcloud before insufflation
             norm = datafile['input_normals'].float(),            # Vertex normals calculated from mesh
-            feat = datafile['patient_features'].float(),         # Patient features, such as length
+            pt_feat = pt_feat,                                   # Patient features, such as length
             anns_start = datafile['annotations_start'].float(),  # Labelled locations on not-insufflated abdomen
             anns_end = datafile['annotations_end'].float(),      # Labelled locations on insufflated abdomen
             pos_end = datafile['target_points'].float(),         # Measured pointcloud after insufflation

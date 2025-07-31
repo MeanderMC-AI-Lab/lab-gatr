@@ -1,0 +1,19 @@
+# To avoid a "Segmentation fault" error when importing PointNet from torch_dvf, use these versions instead
+
+# First, install the right torch (geometric) libraries, based on torch==2.5.1
+pip3 uninstall -y torch-geometric torch torchvision torchaudio torch-scatter torch-cluster chamferdist
+pip3 install torch==2.5.1 --extra-index-url https://download.pytorch.org/whl/cu124
+pip3 install torchvision==0.20.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124
+pip3 install torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124
+pip3 install torch-geometric==2.5.3
+pip3 install torch-scatter -f https://data.pyg.org/whl/torch-2.5.1+cu124
+pip3 install torch-cluster -f https://data.pyg.org/whl/torch-2.5.1+cu124
+
+# Install old version of xformers that works with torch==2.5.1
+pip3 uninstall xformers
+pip3 install xformers==0.0.29.post1
+
+# Install chamferdist from source
+git clone https://github.com/krrish94/chamferdist.git
+cd chamferdist
+python3 setup.py install
