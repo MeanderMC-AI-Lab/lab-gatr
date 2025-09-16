@@ -1,5 +1,5 @@
-import wandb_impostor as wandb
-# import wandb
+# import wandb_impostor as wandb
+import wandb
 from argparse import ArgumentParser
 from lab_gatr.transforms import PointCloudPoolingScales
 import torch_geometric as pyg
@@ -14,13 +14,14 @@ from tqdm import tqdm
 import statistics
 from torch.nn.parallel import DistributedDataParallel
 from functools import partial
-from utils import Evaluation, calc_closest_preds, calc_chamfer_distance, EarlyStopping
+from utils import Validation, Evaluation, calc_closest_preds, calc_chamfer_distance, EarlyStopping
+from losses import L2Loss, ChamferLoss, SlicedWasserStein, LaplacianLoss, NormalLoss
 import meshio
 import sys
 import json
+import pdb
 from time import asctime
 from visualisation import save_pred_and_gt_pointclouds
-from chamferdist import ChamferDistance
 from sklearn.model_selection import KFold
 from lab_gatr.nn.mlp.vanilla import MLP
 from torch_dvf.models import PointNet, SEPointNet
@@ -36,10 +37,10 @@ def calculate_inputs():
     if args.feat_umbilicus:
         multivectors += 1
         scalars += 1
-    if args.feat_longitudinal:
-        scalars += 1
     if args.feat_patient:
         scalars += 5
+    if args.pos_enc:
+        scalars += 36
     return multivectors, scalars
 
 
@@ -53,7 +54,10 @@ parser.add_argument('--num_epochs', type=int, default=30)
 parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--learning_rate', type=float, default=3e-4)  # best learning rate for Adam, hands down
 parser.add_argument('--lr_decay_gamma', type=float, default=0.9989)
-parser.add_argument('--loss', type=str, choices=['l1', 'l2', 'chamfer'], default='chamfer')
+parser.add_argument('--loss', type=str, choices=['l1', 'l2', 'chamfer', 'wasserstein'], default='chamfer')
+parser.add_argument('--loss_laplacian', type=float, default=0.)
+parser.add_argument('--loss_normals', type=float, default=0.)
+parser.add_argument('--patience', type=int, default=3)
 # Model settings
 parser.add_argument('--rel_sampling_ratio', type=float, default=0.05)  # Works for LaB-GATr only
 parser.add_argument('--model', type=str, choices=['labgatr', 'pointnet', 'sepointnet', 'mlp'], default='labgatr')
@@ -64,10 +68,11 @@ parser.add_argument('--num_blocks', type=int, default=10)  # LaB-GATr
 parser.add_argument('--num_attn_heads', type=int, default=4)  # LaB-GATr
 parser.add_argument('--num_latent_channels', type=int, default=256)  # PointNet++
 # Features settings
+parser.add_argument('--spherical_enc', action='store_true')
 parser.add_argument('--feat_norm', action='store_true')
 parser.add_argument('--feat_umbilicus', action='store_true')
-parser.add_argument('--feat_longitudinal', action='store_true')
 parser.add_argument('--feat_patient', action='store_true')
+parser.add_argument('--pos_enc', action='store_true')
 args = parser.parse_args()
 wandb_config = vars(args)
 # Calculate number of point features
@@ -75,18 +80,40 @@ args.multivectors, args.scalars = calculate_inputs()
 args.num_input_channels = args.multivectors * 3 + args.scalars
 
 
+def cartesian_to_spherical(x: torch.Tensor) -> torch.Tensor:
+    r = torch.linalg.norm(x, dim=-1)
+    r = torch.clamp(r, min=torch.finfo(x.dtype).eps)
+    theta = torch.acos(torch.clamp(x[..., 2] / r, -1., 1.))
+    phi = torch.atan2(x[..., 1], x[..., 0])
+    return torch.stack([r, theta, phi], dim=-1)
+
+
+def spherical_to_cartesian(x: torch.Tensor) -> torch.Tensor:
+    r, theta, phi = x.unbind(dim=-1)
+    sin_theta = torch.sin(theta)
+    x = r * sin_theta * torch.cos(phi)
+    y = r * sin_theta * torch.sin(phi)
+    z = r * torch.cos(theta)
+    return torch.stack([x, y, z], dim=-1)
+
+
 @torch.no_grad()
 def positional_encoding(data):
+    # Transform to spherical coordinates if indicated
+    if args.spherical_enc:
+        data.pos = cartesian_to_spherical(data.pos)
+        data.norm = cartesian_to_spherical(data.norm)
+    # Concatenate all features into a single vector x
     features = []
     if args.feat_norm:
         features.append(data.norm)
     if args.feat_umbilicus:
         features.append(data.umb_vec)
         features.append(data.umb_dist.unsqueeze(1))
-    if args.feat_longitudinal:
-        features.append(data.long_pos.unsqueeze(1))
     if args.feat_patient:
         features.append(data.pt_feat)
+    if args.pos_enc:
+        features.append(data.pos_enc)
     data.x = torch.cat(features, dim=1) if features else \
         torch.empty((data.pos.shape[0], 0), device=data.pos.device)
     return data
@@ -224,25 +251,6 @@ def select_transform(model_type):
         return positional_encoding
 
 
-class L2Loss(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.mse = torch.nn.MSELoss()
-        
-    def forward(self, yhat, y):
-        return torch.sqrt(self.mse(yhat, y) + 1e-8)
-
-
-class ChamferLoss(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.chamfer = ChamferDistance()
-
-    def forward(self, yhat, y):
-        loss = self.chamfer(yhat, y, bidirectional=True, point_reduction='mean')
-        return torch.sqrt(.5 * loss)
-
-
 def main(rank, num_gpus):
     assert num_gpus == 1
 
@@ -322,49 +330,88 @@ def get_dataset_slices_for_gpus(num_gpus, num_samples, first_sample_idx=0):
 def load_neural_network_weights(neural_network, working_directory=""):
     if os.path.exists(os.path.join(working_directory, "neural_network_weights.pt")):
 
-        neural_network.load_state_dict(torch.load(os.path.join(working_directory, "neural_network_weights.pt"), weights_only=False))
+        neural_network.load_state_dict(torch.load(os.path.join(working_directory, "neural_network_weights.pt"), weights_only=True))
         print("Resuming from pre-trained neural-network weights.")
 
 
 def training_loop(rank, neural_network, training_device, training_data_loader, validation_data_loader, working_directory):
 
-    loss_options = {'l1': torch.nn.L1Loss(), 'l2': L2Loss(), 'chamfer': ChamferLoss()}
+    loss_options = {'l1': torch.nn.L1Loss(), 'l2': L2Loss(), 'chamfer': ChamferLoss(),
+                    'wasserstein': SlicedWasserStein()}
     loss_function = loss_options[args.loss]
+    lap_function = LaplacianLoss(k=16) if args.loss_laplacian else None
+    norm_function = NormalLoss() if args.loss_normals else None
 
     optimiser = torch.optim.Adam(neural_network.parameters(), lr=wandb.config['learning_rate'])
     load_optimiser_state(rank, optimiser, working_directory)
 
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=optimiser, gamma=wandb.config['lr_decay_gamma'])
-    early_stopping = EarlyStopping(patience=3, min_delta=0.0001)
+    early_stopping = EarlyStopping(args.patience, min_delta=0.0001) if args.patience else None
 
     for epoch in tqdm(range(wandb.config['num_epochs']), desc="Epochs", position=0, leave=True):
 
-        loss_values = {'training': [], 'validation': []}
+        loss_values = {'training': [], 'train_laplacian': [], 'train_normals': [],
+                       'validation': [], 'valid_laplacian': [], 'valid_normals': []}
 
         # Objective convergence
         neural_network.train()
 
-        for batch in tqdm(training_data_loader, desc="Training split", position=1, leave=False):
+        pbar = tqdm(training_data_loader, desc="Train", position=1, leave=False)
+        for batch in pbar:
             optimiser.zero_grad()
-
             batch = batch.to(training_device)
+            
             if args.model == 'mlp':
                 prediction = neural_network(torch.cat([batch.pos, batch.x], dim=1))
             else:
                 prediction = neural_network(batch)
-                
+
+            if args.spherical_enc:
+                prediction = spherical_to_cartesian(prediction)
+                batch.pos = spherical_to_cartesian(batch.pos)
+
+            # Calculate base loss
             if args.loss in ['l1', 'l2']:
                 loss_value = loss_function(prediction, batch.y)
-            else:
+            elif args.loss == 'wasserstein':
+                loss_value = loss_function(batch.pos + prediction, batch.pos_end)
+            elif args.loss == 'chamfer':
                 loss_value = loss_function((batch.pos + prediction).unsqueeze(0),
-                                           batch.pos_end.unsqueeze(0))
+                                               batch.pos_end.unsqueeze(0))
+            else:
+                raise ValueError(f"Unknown loss: {args.loss}")
+
+            # Additional regularization loss
+            loss_lap = torch.zeros((), dtype=torch.float32, device=training_device)
+            loss_norm = torch.zeros((), dtype=torch.float32, device=training_device)
+            if args.loss_laplacian:
+                loss_lap = args.loss_laplacian * lap_function(batch.pos, batch.pos + prediction)
+            if args.loss_normals:
+                loss_norm = args.loss_normals * norm_function(
+                    (batch.pos + prediction),
+                    batch.faces,
+                    batch.pos_end,
+                    batch.norm_end
+                )
+            loss_value = loss_value + loss_lap + loss_norm
             
+            # Optimize model weights
             loss_values['training'].append(loss_value.item())
+            loss_values['train_laplacian'].append(loss_lap.item())
+            loss_values['train_normals'].append(loss_norm.item())
             loss_value.backward()  # "autograd" hook fires and triggers gradient synchronisation across processes
+            if not all(torch.isfinite(p).all() and (p.grad is None or torch.isfinite(p.grad).all()) for p in neural_network.parameters()):
+                pdb.set_trace()
             torch.nn.utils.clip_grad_norm_(neural_network.parameters(), max_norm=1.0, error_if_nonfinite=True)
             optimiser.step()
-
             del batch, prediction
+
+            # Log losses
+            pbar.set_postfix({
+                "Loss": f"{loss_value:.5f}",
+                "LaPlacian": f"{loss_lap:.5f}",
+                "Normals": f"{loss_norm:.5f}"
+            })
 
         scheduler.step()
 
@@ -374,37 +421,78 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
 
         # Learning task
         neural_network.eval()
+        validation = Validation()
 
         with torch.no_grad():
-            for batch in tqdm(validation_data_loader, desc="Validation split", position=1, leave=False):
+            pbar = tqdm(validation_data_loader, desc="Validation", position=1, leave=False)
+            for i, batch in enumerate(pbar):
 
                 batch = batch.to(training_device)
                 if args.model == 'mlp':
                     prediction = neural_network(torch.cat([batch.pos, batch.x], dim=1))
                 else:
                     prediction = neural_network(batch)
-                target = batch.y if args.loss in ['l1', 'l2'] else batch.pos_end
+
+                if args.spherical_enc:
+                    prediction = spherical_to_cartesian(prediction)
+                    batch.pos = spherical_to_cartesian(batch.pos)
+
+                # Calculate validation metrics on annotated points
+                anns_prediction = calc_closest_preds(batch.anns_start, batch.pos, prediction, print_dist=False)
+                validation.append_values({
+                    'anns_gt': (batch.anns_end - batch.anns_start).cpu(),
+                    'anns_pred': anns_prediction.cpu(),
+                    'scatter_idx': torch.tensor(i),
+                })
                 
+                # Calculate base loss
                 if args.loss in ['l1', 'l2']:
                     loss_value = loss_function(prediction, batch.y)
-                else:
+                elif args.loss == 'wasserstein':
+                    loss_value = loss_function(batch.pos + prediction, batch.pos_end)
+                elif args.loss == 'chamfer':
                     loss_value = loss_function((batch.pos + prediction).unsqueeze(0),
-                                               batch.pos_end.unsqueeze(0))
-                loss_values['validation'].append(loss_value.item())
+                                                   batch.pos_end.unsqueeze(0))
+                else:
+                    raise ValueError(f"Unknown loss: {args.loss}")
 
+                # Additional regularization loss
+                loss_lap = torch.zeros((), dtype=torch.float32, device=training_device)
+                loss_norm = torch.zeros((), dtype=torch.float32, device=training_device)
+                if args.loss_laplacian:
+                    loss_lap = args.loss_laplacian * lap_function(batch.pos, batch.pos + prediction)
+                if args.loss_normals:
+                    loss_norm = args.loss_normals * norm_function(
+                        (batch.pos + prediction),
+                        batch.faces,
+                        batch.pos_end,
+                        batch.norm_end
+                    )
+                loss_value = loss_value + loss_lap + loss_norm
+                loss_values['validation'].append(loss_value.item())
+                loss_values['valid_laplacian'].append(loss_lap.item())
+                loss_values['valid_normals'].append(loss_norm.item())
                 del batch, prediction
 
-        wandb.log({key: statistics.mean(value) for key, value in loss_values.items()} | {'epoch': epoch})
-        early_stopping(statistics.mean(loss_values['validation']))
-        if early_stopping.early_stop:
-            print(f"Early stopping training with: {statistics.mean(loss_values['validation']):.4f} (val loss)")
-            break
+                # Log losses
+                pbar.set_postfix({
+                    "Loss": f"{loss_value:.5f}",
+                    "LaPlacian": f"{loss_lap:.5f}",
+                    "Normals": f"{loss_norm:.5f}"
+                })
+
+        wandb.log({key: statistics.mean(value) for key, value in loss_values.items()} | {'epoch': epoch} | validation.get_results())
+        if early_stopping is not None:
+            early_stopping(statistics.mean(loss_values['validation']))
+            if early_stopping.early_stop:
+                print(f"Early stopping training with: {statistics.mean(loss_values['validation']):.4f} (val loss)")
+                break
 
 
 def load_optimiser_state(rank, optimiser, working_directory=""):
     if os.path.exists(os.path.join(working_directory, f"rank_{rank}_optimiser_state.pt")):
 
-        optimiser.load_state_dict(torch.load(os.path.join(working_directory, f"rank_{rank}_optimiser_state.pt"), weights_only=False))
+        optimiser.load_state_dict(torch.load(os.path.join(working_directory, f"rank_{rank}_optimiser_state.pt"), weights_only=True))
         print("Resuming from previous optimiser state.")
 
 
@@ -431,11 +519,17 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
         # Quantitative
         for i, data in enumerate(tqdm(dataset[test_dataset_slice], desc="Test split", position=0, leave=False)):
             data = data.to(training_device)
+            
             if args.model == 'mlp':
                 prediction = neural_network(torch.cat([data.pos, data.x], dim=1))
             else:
                 prediction = neural_network(data)
-            label_prediction = calc_closest_preds(data.anns_start, data.pos, prediction)
+
+            if args.spherical_enc:
+                prediction = spherical_to_cartesian(prediction)
+                data.pos = spherical_to_cartesian(data.pos)
+            
+            label_prediction = calc_closest_preds(data.anns_start, data.pos, prediction, print_dist=False)
             chamfer = chamfer_loss((data.pos + prediction).unsqueeze(0),
                                    data.pos_end.unsqueeze(0))
             
@@ -456,19 +550,31 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
         # Qualitative (visual)
         # neural_network.cpu()  # un-comment to avoid memory issues
         if args.run_id != "sweep":
-            for idx in tqdm(visualisation_dataset_range, desc="Visualisation split", position=0, leave=False):
+            for idx in tqdm(visualisation_dataset_range, desc="Visualisation", position=0, leave=False):
                 data = dataset.__getitem__(idx).to(training_device)  # avoid "Floating point exception"
                 if args.model == 'mlp':
                     data.Y = neural_network(torch.cat([data.pos, data.x], dim=1))
                 else:
                     data.Y = neural_network(data)
+
+                if args.spherical_enc:
+                    data.Y = spherical_to_cartesian(data.Y)
+                    data.pos = spherical_to_cartesian(data.pos)
     
                 if working_directory and not os.path.exists(working_directory):
                     os.makedirs(working_directory)
     
                 data.cpu()
-                save_pred_and_gt_pointclouds(working_directory, data.pos.numpy(),
-                    data.y.numpy(), data.Y.numpy(), idx)
+                save_pred_and_gt_pointclouds(
+                    working_directory,
+                    data.pos,
+                    data.norm,
+                    data.pos_end,
+                    data.norm_end,
+                    data.Y,
+                    data.faces,
+                    idx
+                )
 
 
 def ddp_setup(rank, num_gpus, project_name, wandb_config, run_id=None):

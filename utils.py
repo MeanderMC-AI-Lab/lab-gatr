@@ -18,6 +18,98 @@ def calc_chamfer_distance(pcd1, pcd2):
     dists2 = dists.min(dim=0)[0]
     return (dists1.mean() + dists2.mean()) / 2
 
+class Validation():
+    def __init__(self):
+        self.values_dict = {
+            'anns_gt': [],
+            'anns_pred': [],
+            'anns_idx': []
+        }
+        self.results = {}
+
+    def append_values(self, value_dict):
+        for key, value in value_dict.items():
+            if key == 'scatter_idx':
+                self.values_dict['anns_idx'].append(value.expand(value_dict['anns_gt'].size(0)))
+            else:
+                self.values_dict[key].append(value)
+
+    def get_nmae(self, key_gt, key_pred, key_idx, normalize_max=False):
+        if normalize_max:
+            return self.get_mae(key_gt, key_pred, key_idx) / torch.max(torch.linalg.norm(self.values_dict[key_gt], dim=-1))
+        l2_error = torch.linalg.norm(self.values_dict[key_gt] - self.values_dict[key_pred], dim=-1)
+        magnitude = torch.linalg.norm(self.values_dict[key_gt], dim=-1).clamp(min=1e-8)
+        nmae = scatter(
+            l2_error / magnitude,
+            self.values_dict[key_idx],
+            dim=0,
+            reduce='mean'
+        )
+        return nmae
+
+    def get_mae(self, key_gt, key_pred, key_idx):
+        mae = scatter(
+            torch.linalg.norm(self.values_dict[key_gt] - self.values_dict[key_pred], dim=-1),
+            self.values_dict[key_idx],
+            dim=0,
+            reduce='mean'
+        )
+        return mae
+
+    def get_norml1(self, key_gt, key_pred, key_idx):
+        norml1 = scatter(
+            torch.sum(torch.abs(self.values_dict[key_gt] - self.values_dict[key_pred]), dim=-1) / 3.,
+            self.values_dict[key_idx],
+            dim=0,
+            reduce='mean'
+        )
+        return norml1
+
+    def get_magnitude_error(self, key_gt, key_pred, key_idx):
+        magn_gt = torch.linalg.norm(self.values_dict[key_gt], dim=-1).clamp(min=1e-8)
+        magn_pred = torch.linalg.norm(self.values_dict[key_pred], dim=-1)
+        magnitude_error = scatter(
+            torch.abs(magn_gt - magn_pred) / magn_gt,
+            self.values_dict[key_idx],
+            dim=0,
+            reduce='mean'
+        )
+        return magnitude_error
+
+    def get_angle_error(self, key_gt, key_pred, key_idx):
+        dot_products = (self.values_dict[key_pred] * self.values_dict[key_gt]).sum(dim=-1)
+        denom = torch.linalg.norm(self.values_dict[key_pred], dim=-1) * torch.linalg.norm(self.values_dict[key_gt], dim=-1).clamp(min=1e-8)
+        cos_angles = torch.clamp(dot_products / denom, -1., 1.)
+        angle_error = scatter(
+            torch.acos(cos_angles) * 180. / torch.pi,
+            self.values_dict[key_idx],
+            dim=0,
+            reduce='mean'
+        )
+        return angle_error
+
+    def calc_results(self):
+        self.values_dict = {key: torch.cat(value, dim=0) for key, value in self.values_dict.items()}
+        results = {
+            'anns_mae': self.get_mae('anns_gt', 'anns_pred', 'anns_idx'),
+            'anns_l1': self.get_norml1('anns_gt', 'anns_pred', 'anns_idx'),
+            'anns_nmae': self.get_nmae('anns_gt', 'anns_pred', 'anns_idx'),
+            'anns_angle': self.get_angle_error('anns_gt', 'anns_pred', 'anns_idx'),
+            'anns_magn': self.get_magnitude_error('anns_gt', 'anns_pred', 'anns_idx')
+        }
+        return results
+
+    def get_results(self):
+        if not self.results:
+            self.results = self.calc_results()
+        return {
+            'valid_MAE_anns': torch.mean(self.results['anns_mae']).item(),
+            'valid_L1_anns': torch.mean(self.results['anns_l1']).item(),
+            'valid_NMAE_anns': torch.mean(self.results['anns_nmae']).item(),
+            'valid_magn_anns': torch.mean(self.results['anns_magn']).item(),
+            'valid_angle_anns': torch.mean(self.results['anns_angle']).item(),
+        }
+
 
 class Evaluation():
     def __init__(self):
@@ -64,6 +156,15 @@ class Evaluation():
         )
         return mae
 
+    def get_norml1(self, key_gt, key_pred, key_idx):
+        norml1 = scatter(
+            torch.sum(self.values_dict[key_gt] - self.values_dict[key_pred], dim=-1) / 3.,
+            self.values_dict[key_idx],
+            dim=0,
+            reduce='mean'
+        )
+        return norml1
+
     def get_magnitude_error(self, key_gt, key_pred, key_idx):
         magn_gt = torch.linalg.norm(self.values_dict[key_gt], dim=-1).clamp(min=1e-8)
         magn_pred = torch.linalg.norm(self.values_dict[key_pred], dim=-1)
@@ -86,7 +187,6 @@ class Evaluation():
             reduce='mean'
         )
         return angle_error
-            
 
     def get_approximation_error(self):
         approximation_error = torch.sqrt(scatter(
@@ -120,12 +220,14 @@ class Evaluation():
         self.values_dict = {key: torch.cat(value, dim=0) for key, value in self.values_dict.items()}
         results = {
             'disps_mae': self.get_mae('disps_gt', 'disps_pred', 'disps_idx'),
+            'disps_norml1': self.get_norml1('disps_gt', 'disps_pred', 'disps_idx'),
             'disps_nmae': self.get_nmae('disps_gt', 'disps_pred', 'disps_idx'),
             'disps_magn': self.get_magnitude_error('disps_gt', 'disps_pred', 'disps_idx'),
             'disps_angle': self.get_angle_error('disps_gt', 'disps_pred', 'disps_idx'),
             'approximation_error': self.get_approximation_error(),
             'mean_cosine_similarity': self.get_mean_cosine_similarity(),
             'anns_mae': self.get_mae('anns_gt', 'anns_pred', 'anns_idx'),
+            'anns_norml1': self.get_norml1('anns_gt', 'anns_pred', 'anns_idx'),
             'anns_nmae': self.get_nmae('anns_gt', 'anns_pred', 'anns_idx'),
             'anns_angle': self.get_angle_error('anns_gt', 'anns_pred', 'anns_idx'),
             'anns_magn': self.get_magnitude_error('anns_gt', 'anns_pred', 'anns_idx')
@@ -138,6 +240,8 @@ class Evaluation():
         return {
             'MAE_neuralode': torch.mean(self.results['disps_mae']).item(),
             'MAE_neuralode_std': torch.std(self.results['disps_mae']).item(),
+            'L1_neuralode': torch.mean(self.results['disps_norml1']).item(),
+            'L1_neuralode_std': torch.std(self.results['disps_norml1']).item(),
             'NMAE_neuralode': torch.mean(self.results['disps_nmae']).item(),
             'NMAE_neuralode_std': torch.std(self.results['disps_nmae']).item(),
             'magn_neuralode': torch.mean(self.results['disps_magn']).item(),
@@ -146,6 +250,8 @@ class Evaluation():
             'angle_neuralode_std': torch.std(self.results['disps_angle']).item(),
             'MAE_anns': torch.mean(self.results['anns_mae']).item(),
             'MAE_anns_std': torch.std(self.results['anns_mae']).item(),
+            'L1_anns': torch.mean(self.results['anns_norml1']).item(),
+            'L1_anns_std': torch.std(self.results['anns_norml1']).item(),
             'NMAE_anns': torch.mean(self.results['anns_nmae']).item(),
             'NMAE_anns_std': torch.std(self.results['anns_nmae']).item(),
             'magn_anns': torch.mean(self.results['anns_magn']).item(),
@@ -166,6 +272,12 @@ class Evaluation():
             "MAE (neuralODE)",
             "{0:.4f}".format(torch.mean(self.results['disps_mae']).item()),
             "{0:.4f}".format(torch.std(self.results['disps_mae']).item())
+        ])
+
+        table.add_row([
+            "L1 (neuralODE)",
+            "{0:.4f}".format(torch.mean(self.results['disps_norml1']).item()),
+            "{0:.4f}".format(torch.std(self.results['disps_norml1']).item())
         ])
 
         table.add_row([
@@ -192,6 +304,12 @@ class Evaluation():
             "MAE (annotations)",
             "{0:.4f}".format(torch.mean(self.results['anns_mae']).item()),
             "{0:.4f}".format(torch.std(self.results['anns_mae']).item())
+        ])
+
+        table.add_row([
+            "L1 (annotations)",
+            "{0:.4f}".format(torch.mean(self.results['anns_norml1']).item()),
+            "{0:.4f}".format(torch.std(self.results['anns_norml1']).item())
         ])
 
         table.add_row([
