@@ -126,8 +126,9 @@ class NormalLoss(torch.nn.Module):
         normals = F.normalize(normals, dim=1, eps=1e-12)
 
         # Orient normals towards the direction of the camera
-        mask = normals[:, 2] > 0
-        normals[mask] *= -1
+        # mask = normals[:, 2] > 0
+        # normals[mask] *= -1
+        normals = normals * -torch.sign(normals[:, 2]).unsqueeze(1)
         return normals
 
     @torch.no_grad()
