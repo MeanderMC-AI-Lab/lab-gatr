@@ -1,0 +1,10 @@
+python3 inference_ctscans.py --data_root "/data/Predict-Pneumoperitoneum_LaB-GATr/ct_scans/pointclouds_iso" --model_weights "/app/lab-gatr/runs/labgatr/exp-46/fold0/neural_network_weights.pt" --fold 0
+python3 inference_ctscans.py --data_root "/data/Predict-Pneumoperitoneum_LaB-GATr/ct_scans/pointclouds_iso" --model_weights "/app/lab-gatr/runs/labgatr/exp-46/fold1/neural_network_weights.pt" --fold 1
+python3 inference_ctscans.py --data_root "/data/Predict-Pneumoperitoneum_LaB-GATr/ct_scans/pointclouds_iso" --model_weights "/app/lab-gatr/runs/labgatr/exp-46/fold2/neural_network_weights.pt" --fold 2
+python3 inference_ctscans.py --data_root "/data/Predict-Pneumoperitoneum_LaB-GATr/ct_scans/pointclouds_iso" --model_weights "/app/lab-gatr/runs/labgatr/exp-46/fold3/neural_network_weights.pt" --fold 3
+python3 inference_ctscans.py --data_root "/data/Predict-Pneumoperitoneum_LaB-GATr/ct_scans/pointclouds_iso" --model_weights "/app/lab-gatr/runs/labgatr/exp-46/fold4/neural_network_weights.pt" --fold 4
+python3 inference_ctscans.py --data_root "/data/Predict-Pneumoperitoneum_LaB-GATr/ct_scans/pointclouds_iso" --model_weights "/app/lab-gatr/runs/labgatr/exp-46/fold5/neural_network_weights.pt" --fold 5
+python3 inference_ctscans.py --data_root "/data/Predict-Pneumoperitoneum_LaB-GATr/ct_scans/pointclouds_iso" --model_weights "/app/lab-gatr/runs/labgatr/exp-46/fold6/neural_network_weights.pt" --fold 6
+python3 inference_ctscans.py --data_root "/data/Predict-Pneumoperitoneum_LaB-GATr/ct_scans/pointclouds_iso" --model_weights "/app/lab-gatr/runs/labgatr/exp-46/fold7/neural_network_weights.pt" --fold 7
+python3 inference_ctscans.py --data_root "/data/Predict-Pneumoperitoneum_LaB-GATr/ct_scans/pointclouds_iso" --model_weights "/app/lab-gatr/runs/labgatr/exp-46/fold8/neural_network_weights.pt" --fold 8
+python3 inference_ctscans.py --data_root "/data/Predict-Pneumoperitoneum_LaB-GATr/ct_scans/pointclouds_iso" --model_weights "/app/lab-gatr/runs/labgatr/exp-46/fold9/neural_network_weights.pt" --fold 9

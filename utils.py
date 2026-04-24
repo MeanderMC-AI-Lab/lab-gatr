@@ -219,13 +219,13 @@ class Evaluation():
     def calc_results(self):
         self.values_dict = {key: torch.cat(value, dim=0) for key, value in self.values_dict.items()}
         results = {
-            'disps_mae': self.get_mae('disps_gt', 'disps_pred', 'disps_idx'),
-            'disps_norml1': self.get_norml1('disps_gt', 'disps_pred', 'disps_idx'),
-            'disps_nmae': self.get_nmae('disps_gt', 'disps_pred', 'disps_idx'),
-            'disps_magn': self.get_magnitude_error('disps_gt', 'disps_pred', 'disps_idx'),
-            'disps_angle': self.get_angle_error('disps_gt', 'disps_pred', 'disps_idx'),
-            'approximation_error': self.get_approximation_error(),
-            'mean_cosine_similarity': self.get_mean_cosine_similarity(),
+            # 'disps_mae': self.get_mae('disps_gt', 'disps_pred', 'disps_idx'),
+            # 'disps_norml1': self.get_norml1('disps_gt', 'disps_pred', 'disps_idx'),
+            # 'disps_nmae': self.get_nmae('disps_gt', 'disps_pred', 'disps_idx'),
+            # 'disps_magn': self.get_magnitude_error('disps_gt', 'disps_pred', 'disps_idx'),
+            # 'disps_angle': self.get_angle_error('disps_gt', 'disps_pred', 'disps_idx'),
+            # 'approximation_error': self.get_approximation_error(),
+            # 'mean_cosine_similarity': self.get_mean_cosine_similarity(),
             'anns_mae': self.get_mae('anns_gt', 'anns_pred', 'anns_idx'),
             'anns_norml1': self.get_norml1('anns_gt', 'anns_pred', 'anns_idx'),
             'anns_nmae': self.get_nmae('anns_gt', 'anns_pred', 'anns_idx'),
@@ -238,16 +238,16 @@ class Evaluation():
         if not self.results:
             self.results = self.calc_results()
         return {
-            'MAE_neuralode': torch.mean(self.results['disps_mae']).item(),
-            'MAE_neuralode_std': torch.std(self.results['disps_mae']).item(),
-            'L1_neuralode': torch.mean(self.results['disps_norml1']).item(),
-            'L1_neuralode_std': torch.std(self.results['disps_norml1']).item(),
-            'NMAE_neuralode': torch.mean(self.results['disps_nmae']).item(),
-            'NMAE_neuralode_std': torch.std(self.results['disps_nmae']).item(),
-            'magn_neuralode': torch.mean(self.results['disps_magn']).item(),
-            'magn_neuralode_std': torch.std(self.results['disps_magn']).item(),
-            'angle_neuralode': torch.mean(self.results['disps_angle']).item(),
-            'angle_neuralode_std': torch.std(self.results['disps_angle']).item(),
+            # 'MAE_neuralode': torch.mean(self.results['disps_mae']).item(),
+            # 'MAE_neuralode_std': torch.std(self.results['disps_mae']).item(),
+            # 'L1_neuralode': torch.mean(self.results['disps_norml1']).item(),
+            # 'L1_neuralode_std': torch.std(self.results['disps_norml1']).item(),
+            # 'NMAE_neuralode': torch.mean(self.results['disps_nmae']).item(),
+            # 'NMAE_neuralode_std': torch.std(self.results['disps_nmae']).item(),
+            # 'magn_neuralode': torch.mean(self.results['disps_magn']).item(),
+            # 'magn_neuralode_std': torch.std(self.results['disps_magn']).item(),
+            # 'angle_neuralode': torch.mean(self.results['disps_angle']).item(),
+            # 'angle_neuralode_std': torch.std(self.results['disps_angle']).item(),
             'MAE_anns': torch.mean(self.results['anns_mae']).item(),
             'MAE_anns_std': torch.std(self.results['anns_mae']).item(),
             'L1_anns': torch.mean(self.results['anns_norml1']).item(),
@@ -268,37 +268,37 @@ class Evaluation():
             
         table = PrettyTable(["Metric", "Mean", "Standard Deviation"])
 
-        table.add_row([
-            "MAE (neuralODE)",
-            "{0:.4f}".format(torch.mean(self.results['disps_mae']).item()),
-            "{0:.4f}".format(torch.std(self.results['disps_mae']).item())
-        ])
+        # table.add_row([
+        #     "MAE (neuralODE)",
+        #     "{0:.4f}".format(torch.mean(self.results['disps_mae']).item()),
+        #     "{0:.4f}".format(torch.std(self.results['disps_mae']).item())
+        # ])
 
-        table.add_row([
-            "L1 (neuralODE)",
-            "{0:.4f}".format(torch.mean(self.results['disps_norml1']).item()),
-            "{0:.4f}".format(torch.std(self.results['disps_norml1']).item())
-        ])
+        # table.add_row([
+        #     "L1 (neuralODE)",
+        #     "{0:.4f}".format(torch.mean(self.results['disps_norml1']).item()),
+        #     "{0:.4f}".format(torch.std(self.results['disps_norml1']).item())
+        # ])
 
-        table.add_row([
-            "NMAE (neuralODE)",
-            "{0:.2%}".format(torch.mean(self.results['disps_nmae']).item()),
-            "{0:.2%}".format(torch.std(self.results['disps_nmae']).item())
-        ])
+        # table.add_row([
+        #     "NMAE (neuralODE)",
+        #     "{0:.2%}".format(torch.mean(self.results['disps_nmae']).item()),
+        #     "{0:.2%}".format(torch.std(self.results['disps_nmae']).item())
+        # ])
 
-        table.add_row([
-            "Magnitude (neuralODE)",
-            "{0:.2%}".format(torch.mean(self.results['disps_magn']).item()),
-            "{0:.2%}".format(torch.std(self.results['disps_magn']).item()),
-        ])
+        # table.add_row([
+        #     "Magnitude (neuralODE)",
+        #     "{0:.2%}".format(torch.mean(self.results['disps_magn']).item()),
+        #     "{0:.2%}".format(torch.std(self.results['disps_magn']).item()),
+        # ])
 
-        table.add_row([
-            "Angle (neuralODE)",
-            "{0:.2f}".format(torch.mean(self.results['disps_angle']).item()),
-            "{0:.2f}".format(torch.std(self.results['disps_angle']).item())
-        ])
+        # table.add_row([
+        #     "Angle (neuralODE)",
+        #     "{0:.2f}".format(torch.mean(self.results['disps_angle']).item()),
+        #     "{0:.2f}".format(torch.std(self.results['disps_angle']).item())
+        # ])
 
-        table.add_row(["-"*10, "-"*5, "-"*5])
+        # table.add_row(["-"*10, "-"*5, "-"*5])
 
         table.add_row([
             "MAE (annotations)",
@@ -338,17 +338,17 @@ class Evaluation():
             "{0:.4f}".format(torch.std(self.values_dict['chamf_dist']).item())
         ])
 
-        table.add_row([
-            "Approximation Error",
-            "{0:.2%}".format(torch.mean(self.results['approximation_error']).item()),
-            "{0:.2%}".format(torch.std(self.results['approximation_error']).item())
-        ])
+        # table.add_row([
+        #     "Approximation Error",
+        #     "{0:.2%}".format(torch.mean(self.results['approximation_error']).item()),
+        #     "{0:.2%}".format(torch.std(self.results['approximation_error']).item())
+        # ])
 
-        table.add_row([
-            "Mean Cosine Similarity",
-            "{:.3f}".format(torch.mean(self.results['mean_cosine_similarity']).item()),
-            "{:.3f}".format(torch.std(self.results['mean_cosine_similarity']).item())
-        ])
+        # table.add_row([
+        #     "Mean Cosine Similarity",
+        #     "{:.3f}".format(torch.mean(self.results['mean_cosine_similarity']).item()),
+        #     "{:.3f}".format(torch.std(self.results['mean_cosine_similarity']).item())
+        # ])
 
         return table
 

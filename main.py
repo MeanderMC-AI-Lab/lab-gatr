@@ -46,6 +46,7 @@ def calculate_inputs():
 
 parser = ArgumentParser()
 # Run settings
+parser.add_argument('--cpu', action='store_true')
 parser.add_argument('--data_root', type=str, default='/data/Predict-Pneumoperitoneum_LaB-GATr/dataset')
 parser.add_argument('--run_id', type=str, default="sweep")
 parser.add_argument('--num_gpus', type=int, default=1)
@@ -124,6 +125,7 @@ class GeometricAlgebraInterface:
     num_input_scalars = args.scalars if args.scalars > 0 else 1
     num_output_channels = 1
     num_output_scalars = None
+    print(f"Num multivectors: {num_input_channels}, num scalars: {num_input_scalars}")
 
     @staticmethod
     @torch.no_grad()
@@ -267,7 +269,10 @@ def main(rank, num_gpus):
         print(f"Fold {fold}: {len(train_idx)} (train) {len(val_idx)} (val) {len(test_idx)} (test)")
         working_dir = os.path.join("runs", args.model, f"exp-{args.run_id}", f"fold{fold}")
         ddp_setup(rank, num_gpus, project_name="lab_gatr", wandb_config=wandb_config, run_id=run_name)
-        training_device = torch.device(f'cuda:{rank}')
+        if args.cpu:
+            training_device = torch.device('cpu')
+        else:
+            training_device = torch.device(f'cuda:{rank}')
 
         # Make train and validation dataloaders
         training_data_loader = pyg.loader.DataLoader(
@@ -385,7 +390,13 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
             loss_lap = torch.zeros((), dtype=torch.float32, device=training_device)
             loss_norm = torch.zeros((), dtype=torch.float32, device=training_device)
             if args.loss_laplacian:
-                loss_lap = args.loss_laplacian * lap_function(batch.pos, batch.pos + prediction)
+                # loss_lap = args.loss_laplacian * lap_function(batch.pos, batch.pos + prediction)
+                loss_lap = args.loss_laplacian * lap_function(
+                        batch.pos,
+                        batch.pos + prediction,
+                        batch.laplacian_rowcol,
+                        batch.laplacian_weights
+                    )
             if args.loss_normals:
                 loss_norm = args.loss_normals * norm_function(
                     (batch.pos + prediction),
@@ -460,7 +471,13 @@ def training_loop(rank, neural_network, training_device, training_data_loader, v
                 loss_lap = torch.zeros((), dtype=torch.float32, device=training_device)
                 loss_norm = torch.zeros((), dtype=torch.float32, device=training_device)
                 if args.loss_laplacian:
-                    loss_lap = args.loss_laplacian * lap_function(batch.pos, batch.pos + prediction)
+                    # loss_lap = args.loss_laplacian * lap_function(batch.pos, batch.pos + prediction)
+                    loss_lap = args.loss_laplacian * lap_function(
+                        batch.pos,
+                        batch.pos + prediction,
+                        batch.laplacian_rowcol,
+                        batch.laplacian_weights
+                    )
                 if args.loss_normals:
                     loss_norm = args.loss_normals * norm_function(
                         (batch.pos + prediction),
@@ -568,11 +585,11 @@ def test_loop(neural_network, training_device, dataset, test_dataset_slice, visu
                 save_pred_and_gt_pointclouds(
                     working_directory,
                     data.pos,
-                    data.norm,
+                    # data.norm,
                     data.pos_end,
-                    data.norm_end,
+                    # data.norm_end,
                     data.Y,
-                    data.faces,
+                    # data.faces,
                     idx
                 )
 

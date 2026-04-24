@@ -75,11 +75,11 @@ def angle_weighted_normals(vertices, faces):
     normals = F.normalize(normals, dim=1, eps=1e-6)
 
     # Orient normals towards the direction of the camera
-    mask = normals[:, 2] > 0
-    normals[mask] *= -1
-    # invert = ((vertices * normals).sum(dim=1, keepdim=True) < 0).float()
-    # normals = torch.where(flip, -normals, normals)
-    # normals = F.normalize(normals, dim=1, eps=1e-6)
+    # mask = normals[:, 2] > 0
+    # normals[mask] *= -1
+    invert = ((vertices * normals).sum(dim=1, keepdim=True) < 0)
+    normals = torch.where(invert, -normals, normals)
+    normals = F.normalize(normals, dim=1, eps=1e-6)
     return normals
 
 
@@ -113,41 +113,53 @@ class Dataset(pyg.data.Dataset):
     @staticmethod
     def read_raw_datafile(path):
         datafile = torch.load(path, weights_only=False)
-
+        
         # Load data
         input_points = datafile['input_points'].float() * 100  # Meters to centimeters
         input_faces = datafile['input_faces'].int()
-        input_normals = datafile['input_normals'].float()
+        # input_normals = datafile['input_normals'].float()
         displacements = datafile['displacements'].float() * 100
         target_points = datafile['target_points'].float() * 100
         # target_faces = datafile['target_faces'].int()
-        target_normals = datafile['target_normals'].float()
+        # target_normals = datafile['target_normals'].float()
         annotations_start = datafile['annotations_start'].float() * 100
         annotations_end = datafile['annotations_end'].float() * 100
-        patient_features = datafile['patient_features'].float()
+        # patient_features = datafile['patient_features'].float()
 
         # Transform data
-        num_points = input_points.shape[0]
-        positional_encoding = cartesian_to_positional_encoding(input_points)
-        umbilicus_distances = input_points.norm(dim=1)
-        umbilicus_vectors = -input_points / umbilicus_distances.clamp(min=1e-8).unsqueeze(1)
-        patient_features = patient_features.unsqueeze(0).repeat(num_points, 1)
+        # num_points = input_points.shape[0]
+        # positional_encoding = cartesian_to_positional_encoding(input_points)
+        # umbilicus_distances = input_points.norm(dim=1)
+        # umbilicus_vectors = -input_points / umbilicus_distances.clamp(min=1e-8).unsqueeze(1)
+        # patient_features = patient_features.unsqueeze(0).repeat(num_points, 1)
         # target_normals = angle_weighted_normals(target_points, target_faces)  # TODO: in creating "raw" data file, also store target_points such that they have same size as target_faces
+        input_normals = angle_weighted_normals(input_points, input_faces)
+        
+        # Pre-compute laplacian weights
+        edge_index = pyg.nn.knn_graph(
+            input_points, k=16, batch=None, loop=False
+        )
+        (rowcol, weights) = pyg.utils.get_laplacian(
+            edge_index, normalization=None, num_nodes=input_points.size(0)
+        )
+        weights = weights.view(-1, 1)
 
         # Put into data file
         data = Data(
             pos = input_points,
-            faces = input_faces,
+            # faces = input_faces,
             norm = input_normals,
-            pos_enc = positional_encoding,
+            # pos_enc = positional_encoding,
             y = displacements,
             pos_end = target_points,
-            norm_end = target_normals,
+            # norm_end = target_normals,
             anns_start = annotations_start,
             anns_end = annotations_end,
-            umb_dist = umbilicus_distances,
-            umb_vec = umbilicus_vectors,
-            pt_feat = patient_features
+            # umb_dist = umbilicus_distances,
+            # umb_vec = umbilicus_vectors,
+            # pt_feat = patient_features,
+            laplacian_rowcol = rowcol,
+            laplacian_weights = weights
         )
         return data
 

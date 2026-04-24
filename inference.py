@@ -40,7 +40,7 @@ args = parser.parse_args()
 
 class GeometricAlgebraInterface:
     num_input_channels = 2
-    num_input_scalars = 36
+    num_input_scalars = 1  # 36
     num_output_channels = 1
     num_output_scalars = None
 
@@ -51,7 +51,8 @@ class GeometricAlgebraInterface:
             embed_point(data.pos).view(-1, 1, 16),
             embed_oriented_plane(data.x[:, :3], data.pos).view(-1, 1, 16)
         ), dim=1)
-        scalars = data.x[:, 3:]
+        # scalars = data.x[:, 3:]
+        scalars = torch.zeros(data.pos.shape[0], 1, device=data.pos.device)  # scalars cannot be None, so inputting zeros instead
         return multivectors, scalars
 
     @staticmethod
@@ -105,7 +106,7 @@ def main():
         save_dir = Path(args.input_file).parent
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pred.numpy())
-        o3d.io.write_point_cloud(save_dir / f"ct_scan_pred.ply", pcd)
+        o3d.io.write_point_cloud(save_dir / f"ct_scan_pred3.ply", pcd)
 
 
 if __name__ == '__main__':

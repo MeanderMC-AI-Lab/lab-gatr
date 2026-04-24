@@ -50,9 +50,10 @@ class LaplacianLoss(torch.nn.Module):
         edge_index = pyg.nn.knn_graph(x0, k=self.k, batch=None, loop=False)
         return pyg.utils.get_laplacian(edge_index, normalization=None, num_nodes=x0.size(0))
         
-    def forward(self, x0, x):
-        (row, col), edge_weight = self.build_graph(x0)
-        edge_weight = edge_weight.view(-1, 1)
+    def forward(self, x0, x, rowcol, edge_weight):
+        # (row, col), edge_weight = self.build_graph(x0)
+        # edge_weight = edge_weight.view(-1, 1)
+        row, col = rowcol
         y = scatter_add(edge_weight * x[col], row, dim=0, dim_size=x.size(0))
         return (y**2).sum(dim=1).mean()
 

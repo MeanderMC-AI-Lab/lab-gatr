@@ -22,25 +22,25 @@ def calc_normals(vertices, faces):
     return normals
     
 
-def save_pred_and_gt_pointclouds(save_dir, start, start_norm, end, end_norm, pred, faces, idx):
+def save_pred_and_gt_pointclouds(save_dir, start, end, pred, idx):
     save_dir = os.path.join(save_dir, "vis")
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(start.numpy())
-    pcd.normals = o3d.utility.Vector3dVector(start_norm.numpy())
+    # pcd.normals = o3d.utility.Vector3dVector(start_norm.numpy())
     o3d.io.write_point_cloud(os.path.join(save_dir, f"start_{idx:04d}.ply"), pcd)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(end.numpy())
-    pcd.normals = o3d.utility.Vector3dVector(end_norm.numpy())
+    # pcd.normals = o3d.utility.Vector3dVector(end_norm.numpy())
     o3d.io.write_point_cloud(os.path.join(save_dir, f"end_{idx:04d}.ply"), pcd)
 
     pred = start + pred
-    pred_norm = calc_normals(pred, faces)
+    # pred_norm = calc_normals(pred, faces)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pred.numpy())
-    pcd.normals = o3d.utility.Vector3dVector(pred_norm.numpy())
+    # pcd.normals = o3d.utility.Vector3dVector(pred_norm.numpy())
     o3d.io.write_point_cloud(os.path.join(save_dir, f"pred_{idx:04d}.ply"), pcd)
     
